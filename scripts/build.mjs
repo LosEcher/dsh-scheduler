@@ -6,7 +6,7 @@
  * platform modules resolved through the injected require and everything else
  * inlined. esbuild is resolved from the DSH source checkout.
  *
- * Set DSH_SOURCE to the DSH checkout root (default /Users/echerlos/Downloads/projects/deepseek-harness).
+ * Set DSH_SOURCE to the DSH checkout root (default ~/.dsh/source/current).
  */
 import { createRequire } from 'node:module'
 import { fileURLToPath } from 'node:url'
@@ -15,7 +15,7 @@ import { dirname, join } from 'node:path'
 import { existsSync, readFileSync, readdirSync } from 'node:fs'
 
 const ROOT = join(dirname(fileURLToPath(import.meta.url)), '..')
-const CHECKOUT = process.env.DSH_SOURCE ?? join(homedir(), 'Downloads/projects/deepseek-harness')
+const CHECKOUT = process.env.DSH_SOURCE ?? join(homedir(), '.dsh/source/current')
 
 const MANIFEST = JSON.parse(readFileSync(join(ROOT, 'package.json'), 'utf8'))
 const PLUGIN_ID = MANIFEST.name

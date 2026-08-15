@@ -27,7 +27,9 @@ test('resolveConfig({}) fills env-derived string defaults', async () => {
   const { resolveConfig } = await import(pluginHref)
   const cfg = resolveConfig({})
   assert.equal(typeof cfg.dataDir, 'string')
-  assert.equal(typeof cfg.harnessDir, 'string')
+  // harnessDir is optional now: resolveCliEntry() auto-discovers the dsh CLI
+  // (explicit config/env → ~/.dsh/source/current → profile install → error).
+  assert.ok(cfg.harnessDir === undefined || typeof cfg.harnessDir === 'string')
   assert.equal(typeof cfg.defaultWorkspace, 'string')
   assert.ok(cfg.dataDir.endsWith('/storages/dsh-scheduler'))
   assert.equal(

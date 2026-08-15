@@ -41,7 +41,7 @@ export const inject = ['webServer', 'agents']
 export const Config = Schema.object({
   /** Storage root for jobs.json / runs.jsonl / lock (optional; resolved at runtime). */
   dataDir: Schema.string(),
-  /** Harness checkout root: dsh CLI entry + tsx live here (optional). */
+  /** Harness root: dsh CLI entry lives here (optional; auto-discovered at runtime). */
   harnessDir: Schema.string(),
   /** Default workspace (cwd) for jobs that do not pin one (optional). */
   defaultWorkspace: Schema.string(),
@@ -66,7 +66,9 @@ export function resolveConfig(config) {
   const dshHome = process.env.DSH_HOME ?? `${homedir()}/.dsh`
   return {
     dataDir: config.dataDir ?? `${dshHome}/storages/dsh-scheduler`,
-    harnessDir: config.harnessDir ?? process.env.DSH_HARNESS_DIR ?? '/Users/echerlos/Downloads/projects/deepseek-harness',
+    // harnessDir is optional: resolveCliEntry() auto-discovers the dsh CLI
+    // (explicit config/env → ~/.dsh/source/current → profile install → error).
+    harnessDir: config.harnessDir ?? process.env.DSH_HARNESS_DIR,
     defaultWorkspace: config.defaultWorkspace ?? process.env.DSH_SCHEDULER_WORKSPACE ?? homedir(),
     timeoutMs: config.timeoutMs ?? 30 * 60_000,
     killGraceMs: config.killGraceMs ?? 10_000,
@@ -257,15 +259,40 @@ export function apply(ctx, config) {
   let lastTickAt = null
   let stopping = false
 
-  const defaultEntry = resolveCliEntry(cfg.harnessDir)
+  const defaultEntry = resolveCliEntry()
 
-  function resolveCliEntry(harnessDir) {
-    const bundled = join(harnessDir, 'apps/cli/lib/bin.js')
-    if (existsSync(bundled)) return { args: [bundled], source: 'lib' }
-    return {
-      args: ['--import', join(harnessDir, 'node_modules/tsx/esm'), join(harnessDir, 'apps/cli/src/bin.ts')],
-      source: 'tsx',
+  // Resolve the dsh CLI entry. Discovery order:
+  //   1. explicit cfg.harnessDir (config or DSH_HARNESS_DIR): source checkout
+  //      (apps/cli/lib/bin.js, or apps/cli/src/bin.ts via tsx) or a package
+  //      root containing lib/bin.js (profile install shape)
+  //   2. ~/.dsh/source/current  — harness source checkout convention
+  //   3. $DSH_HOME/profiles/node_modules/@deepseek-ai/dsh  — profile install
+  //   4. clear error pointing at DSH_HARNESS_DIR / harnessDir config
+  function resolveCliEntry() {
+    const dshHome = process.env.DSH_HOME ?? `${homedir()}/.dsh`
+    const candidates = []
+    if (cfg.harnessDir) candidates.push(cfg.harnessDir)
+    candidates.push(join(dshHome, 'source/current'))
+    candidates.push(join(dshHome, 'profiles/node_modules/@deepseek-ai/dsh'))
+
+    for (const root of candidates) {
+      if (!root || !existsSync(root)) continue
+      const bundled = join(root, 'apps/cli/lib/bin.js')
+      if (existsSync(bundled)) return { args: [bundled], source: `lib@${root}` }
+      const tsx = join(root, 'node_modules/tsx/esm')
+      const tsEntry = join(root, 'apps/cli/src/bin.ts')
+      if (existsSync(tsx) && existsSync(tsEntry)) {
+        return { args: ['--import', tsx, tsEntry], source: `tsx@${root}` }
+      }
+      const pkgBin = join(root, 'lib/bin.js')
+      if (existsSync(pkgBin)) return { args: [pkgBin], source: `profile@${root}` }
     }
+
+    throw new Error(
+      'dsh-scheduler: cannot locate the dsh CLI. Set DSH_HARNESS_DIR (or the '
+      + 'harnessDir config) to the harness checkout, or install dsh via '
+      + '`npx @deepseek-ai/dsh` so ~/.dsh/profiles/node_modules/@deepseek-ai/dsh exists.',
+    )
   }
 
   // ---- executor -------------------------------------------------------------

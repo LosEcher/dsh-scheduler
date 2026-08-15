@@ -1,6 +1,6 @@
 # dsh-scheduler bundle patch: host row (mounts /scheduler API + scheduler runtime).
 # Client half (conversation tab) is loaded automatically via dsh.client.
-# Install: dsh plugin --profile web add link:/Users/echerlos/syncthing/project/dsplugins/dsh-scheduler
+# Install: dsh plugin --profile web add github:LosEcher/dsh-scheduler#main
 # (requires dsh web restart; HMR only covers config edits)
 - insert:
     - id: dsh-scheduler

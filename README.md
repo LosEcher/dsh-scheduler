@@ -79,7 +79,7 @@ DSH 内置 `@deepseek-ai/dsh-schedule`（`packages/schedule/schedule`），它�
   // cron:   5 段 cron（支持 */n、a-b、a,b、月份/星期名）
   // interval: expression = "30m" / "2h" / "90s"（最小 60s）
   // once:   expression = ISO 8601 时间戳
-  "workspace": "/Users/echerlos/syncthing/project/dsfolder",  // headless 运行 cwd
+  "workspace": "/path/to/job/workspace",  // headless 运行 cwd
   "enabled": true,
   "state": "scheduled",             // scheduled | paused | completed(once 已触发)
   "deliverTo": { "sessionId": "session-..." },  // 可选：运行结果 followup 进该会话（须在线）
@@ -128,7 +128,7 @@ spawn(process.execPath,
 - 退出码 0 → `succeeded`，非 0 → `failed`；
 - **熔断**：连续失败达到 `maxConsecutiveFailures`（默认 5）→ 自动暂停（`enabled=false, state=paused, pausedReason=max_consecutive_failures`），UI 显示「已熔断暂停」，手动恢复后重新计数；
 - **结果投递**：任务配置 `deliverTo.sessionId` 时，运行结束后把结果摘要（renderDelivery）以 `createUserMessage` + `agent.followup` 注入该会话（须是本 web 实例的 live root agent）；目标不在线则台账记 `delivery.skipped`；
-- `harnessDir` 配置：env `DSH_HARNESS_DIR` → 默认 `/Users/echerlos/Downloads/projects/deepseek-harness`；`defaultWorkspace` 兜底为 `homedir()`（env `DSH_SCHEDULER_WORKSPACE` 优先）。
+- `harnessDir` 配置：可选；缺省自动发现 dsh CLI（env `DSH_HARNESS_DIR` → `~/.dsh/source/current` → profile 安装 `~/.dsh/profiles/node_modules/@deepseek-ai/dsh` → 报错提示）；`defaultWorkspace` 兜底为 `homedir()`（env `DSH_SCHEDULER_WORKSPACE` 优先）。
 
 ### 2.5 REST API（同源 /scheduler）
 
@@ -159,7 +159,7 @@ spawn(process.execPath,
 
 ```bash
 # 1. 注册 bundle（link: 指向本仓库）
-dsh plugin --profile web add link:/Users/echerlos/syncthing/project/dsplugins/dsh-scheduler
+dsh plugin --profile web add github:LosEcher/dsh-scheduler#main
 # 2. 重启 dsh web（宿主插件代码 HMR 不覆盖，必须重启）
 dsh-web-restart.sh
 # 3. 验证
