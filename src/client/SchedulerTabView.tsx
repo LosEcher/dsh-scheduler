@@ -58,6 +58,9 @@ interface Job {
   lastStatus: 'succeeded' | 'failed' | 'skipped' | null
   runCount: number
   consecutiveFailures: number
+  deliverTo?: { sessionId: string }
+  catchUpPolicy?: 'run_once' | 'skip'
+  pausedReason?: string
   createdAt: string
   updatedAt: string
 }
@@ -71,6 +74,7 @@ interface Run {
   durationMs?: number
   outputHead?: string
   error?: string
+  delivery?: { status: 'delivered' | 'skipped' | 'error'; sessionId?: string; reason?: string }
   startedAt?: string
   completedAt?: string
 }
@@ -82,6 +86,10 @@ interface Status {
   enabledCount: number
   maxConcurrent: number
   timeoutMs: number
+  killGraceMs: number
+  maxConsecutiveFailures: number
+  catchUpPolicy: 'run_once' | 'skip'
+  maxLatenessMs: number
 }
 
 // ---- api helpers ----
@@ -135,6 +143,7 @@ export function SchedulerTabView(_props: ConvViewProps) {
   const [form, setForm] = useState({
     name: '', prompt: '', kind: 'cron' as TriggerKind, expression: '0 9 * * *',
     timezone: 'local', workspace: '', enabled: true,
+    deliverTo: '', catchUpPolicy: '',
   })
 
   const load = useCallback(async () => {
@@ -188,7 +197,10 @@ export function SchedulerTabView(_props: ConvViewProps) {
 
   const openCreate = () => {
     setEditing(null)
-    setForm({ name: '', prompt: '', kind: 'cron', expression: '0 9 * * *', timezone: 'local', workspace: '', enabled: true })
+    setForm({
+      name: '', prompt: '', kind: 'cron', expression: '0 9 * * *', timezone: 'local',
+      workspace: '', enabled: true, deliverTo: '', catchUpPolicy: '',
+    })
     setShowForm(true)
   }
 
@@ -198,6 +210,8 @@ export function SchedulerTabView(_props: ConvViewProps) {
       name: job.name, prompt: job.prompt, kind: job.trigger.kind,
       expression: job.trigger.expression, timezone: job.trigger.timezone,
       workspace: job.workspace ?? '', enabled: job.enabled,
+      deliverTo: job.deliverTo?.sessionId ?? '',
+      catchUpPolicy: job.catchUpPolicy ?? '',
     })
     setShowForm(true)
   }
@@ -207,10 +221,12 @@ export function SchedulerTabView(_props: ConvViewProps) {
     setBusy(true)
     setError(null)
     try {
-      const payload = {
+      const payload: Record<string, unknown> = {
         name: form.name, prompt: form.prompt,
         trigger: { kind: form.kind, expression: form.expression, timezone: form.timezone },
         workspace: form.workspace, enabled: form.enabled,
+        deliverTo: form.deliverTo.trim() ? { sessionId: form.deliverTo.trim() } : null,
+        catchUpPolicy: form.catchUpPolicy || undefined,
       }
       if (editing) {
         await sendJson('PATCH', `/scheduler/jobs/${editing.id}`, payload)
@@ -253,6 +269,8 @@ export function SchedulerTabView(_props: ConvViewProps) {
           <span style={MUTED}>tick: {fmt(status?.lastTickAt)}</span>
           <span style={MUTED}>在飞: {status?.inflight.length ?? 0}/{status?.maxConcurrent ?? '?'}</span>
           <span style={MUTED}>任务: {status?.enabledCount ?? '?'}/{status?.jobCount ?? '?'} 启用</span>
+          <span style={MUTED}>熔断: {status?.maxConsecutiveFailures ?? '?'} 连败</span>
+          <span style={MUTED}>追赶: {status?.catchUpPolicy ?? '?'}</span>
           <span style={{ flex: 1 }} />
           <button style={BTN} type="button" onClick={() => void load()} disabled={loading}>刷新</button>
           <button style={BTN_PRIMARY} type="button" onClick={openCreate}>+ 新建任务</button>
@@ -295,6 +313,21 @@ export function SchedulerTabView(_props: ConvViewProps) {
                 onChange={(e) => setForm({ ...form, workspace: e.target.value })}
                 placeholder="如 /Users/echerlos/syncthing/project/dsfolder" />
             </label>
+            <div style={{ ...ROW, alignItems: 'flex-end' }}>
+              <label style={{ fontSize: 12, flex: 2 }}>结果投递会话（deliverTo，留空不投递）
+                <input style={INPUT} value={form.deliverTo}
+                  onChange={(e) => setForm({ ...form, deliverTo: e.target.value })}
+                  placeholder="目标会话 ID；该会话在线时结果 followup 进去" />
+              </label>
+              <label style={{ fontSize: 12, flex: 1 }}>追赶策略
+                <select style={INPUT} value={form.catchUpPolicy}
+                  onChange={(e) => setForm({ ...form, catchUpPolicy: e.target.value })}>
+                  <option value="">跟随全局（run_once）</option>
+                  <option value="run_once">run_once（错过补跑一次）</option>
+                  <option value="skip">skip（超时差即跳过）</option>
+                </select>
+              </label>
+            </div>
             <label style={{ fontSize: 12, ...ROW }}><input type="checkbox" checked={form.enabled}
               onChange={(e) => setForm({ ...form, enabled: e.target.checked })} /> 启用</label>
             <div style={{ fontSize: 12 }}>
@@ -322,9 +355,9 @@ export function SchedulerTabView(_props: ConvViewProps) {
           <div key={job.id} style={CARD}>
             <div style={ROW}>
               <strong>{job.name}</strong>
-              {job.enabled && job.state === 'scheduled'
-                ? <span style={BADGE_OK}>启用</span>
-                : <span style={BADGE_BAD}>{job.state === 'paused' ? '已暂停' : '已完成'}</span>}
+              {job.state === 'paused'
+                ? <span style={BADGE_BAD}>{job.pausedReason === 'max_consecutive_failures' ? '已熔断暂停' : '已暂停'}</span>
+                : job.enabled && job.state === 'scheduled' ? <span style={BADGE_OK}>启用</span> : <span style={BADGE_BAD}>已完成</span>}
               {running ? <span style={BADGE}>运行中…</span> : null}
               <span style={{ flex: 1 }} />
               <button style={BTN} type="button" onClick={() => void act('POST', `/scheduler/jobs/${job.id}/trigger`)} disabled={running}>立即触发</button>
@@ -337,6 +370,8 @@ export function SchedulerTabView(_props: ConvViewProps) {
             <div style={{ ...MUTED, marginTop: 4 }}>
               {TRIGGER_DESC[job.trigger.kind]} {job.trigger.expression} · {job.trigger.timezone}
               {job.workspace ? ` · ${job.workspace}` : ''}
+              {job.deliverTo ? ` · 投递→${job.deliverTo.sessionId}` : ''}
+              {job.catchUpPolicy ? ` · 追赶:${job.catchUpPolicy}` : ''}
             </div>
             <div style={{ ...ROW, marginTop: 4 }}>
               <span style={MUTED}>下次: <b>{fmt(job.nextRunAt)}</b></span>
@@ -365,6 +400,11 @@ export function SchedulerTabView(_props: ConvViewProps) {
                         <span style={MUTED}>触发于 {fmt(r.scheduledFor)}</span>
                         {r.durationMs !== undefined ? <span style={MUTED}>耗时 {(r.durationMs / 1000).toFixed(1)}s</span> : null}
                         {r.exitCode !== undefined ? <span style={MUTED}>exit {r.exitCode}</span> : null}
+                        {r.delivery
+                          ? <span style={r.delivery.status === 'delivered' ? BADGE_OK : BADGE_BAD}>
+                              {r.delivery.status === 'delivered' ? `已投递→${r.delivery.sessionId}` : `投递:${r.delivery.status}`}
+                            </span>
+                          : null}
                         <span style={{ flex: 1 }} />
                         <span style={MUTED}>{fmt(r.completedAt ?? r.startedAt)}</span>
                       </span>

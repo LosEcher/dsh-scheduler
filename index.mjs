@@ -21,6 +21,7 @@
  */
 
 import Schema from '@deepseek-ai/schemastery'
+import { createUserMessage } from '@deepseek-ai/dsh-llm'
 import { spawn } from 'node:child_process'
 import { existsSync, mkdirSync } from 'node:fs'
 import { join } from 'node:path'
@@ -29,7 +30,7 @@ import { Store, newId, nowIso } from './lib/store.mjs'
 import { parseCron, nextCronAfter, cronOccurrences, parseInterval, CronParseError } from './lib/cron-next.mjs'
 
 export const name = 'dsh-scheduler'
-export const inject = ['webServer']
+export const inject = ['webServer', 'agents']
 
 // schemastery `.default()` stores the argument AS-IS (a literal): a factory
 // function would fail Cordis string validation and take down the whole web
@@ -44,12 +45,20 @@ export const Config = Schema.object({
   harnessDir: Schema.string(),
   /** Default workspace (cwd) for jobs that do not pin one (optional). */
   defaultWorkspace: Schema.string(),
-  /** Per-run timeout before the headless process is killed. */
+  /** Per-run timeout before the headless process is killed (SIGTERM). */
   timeoutMs: Schema.number().min(10_000).default(30 * 60_000),
+  /** Grace between SIGTERM and SIGKILL when a headless run does not exit. */
+  killGraceMs: Schema.number().min(1_000).max(120_000).default(10_000),
   /** Max concurrent headless runs. */
   maxConcurrent: Schema.number().min(1).max(8).default(2),
   /** Periodic tick interval (drift/overdue catch-up). */
   tickMs: Schema.number().min(5_000).default(60_000),
+  /** Auto-pause a job after this many consecutive failures (circuit breaker). */
+  maxConsecutiveFailures: Schema.number().min(1).max(100).default(5),
+  /** Global catch-up policy ('run_once' fires a missed occurrence once; 'skip' drops it). */
+  catchUpPolicy: Schema.string(),
+  /** Max lateness for 'skip' catch-up; 0 = unlimited (never skip). */
+  maxLatenessMs: Schema.number().min(0).default(15 * 60_000),
 }).description('dsh-scheduler: DSH 定时任务（cron/interval/once + headless 执行 + 台账）')
 
 /** Resolve runtime config: explicit values win, env falls back, then defaults. */
@@ -58,10 +67,14 @@ export function resolveConfig(config) {
   return {
     dataDir: config.dataDir ?? `${dshHome}/storages/dsh-scheduler`,
     harnessDir: config.harnessDir ?? process.env.DSH_HARNESS_DIR ?? '/Users/echerlos/Downloads/projects/deepseek-harness',
-    defaultWorkspace: config.defaultWorkspace ?? process.env.DSH_SCHEDULER_WORKSPACE ?? process.cwd(),
+    defaultWorkspace: config.defaultWorkspace ?? process.env.DSH_SCHEDULER_WORKSPACE ?? homedir(),
     timeoutMs: config.timeoutMs ?? 30 * 60_000,
+    killGraceMs: config.killGraceMs ?? 10_000,
     maxConcurrent: config.maxConcurrent ?? 2,
     tickMs: config.tickMs ?? 60_000,
+    maxConsecutiveFailures: config.maxConsecutiveFailures ?? 5,
+    catchUpPolicy: config.catchUpPolicy === 'skip' ? 'skip' : 'run_once',
+    maxLatenessMs: config.maxLatenessMs ?? 15 * 60_000,
   }
 }
 
@@ -145,8 +158,66 @@ export function previewTrigger(kind, expression, timezone, count = 5) {
   return [new Date(t).toISOString()]
 }
 
+// ---- pure decision functions (unit-testable) ---------------------------------
+
+/**
+ * Decide whether a due job should fire or be skipped by the catch-up policy.
+ * `run_once` (default) fires a missed occurrence once, however late; `skip`
+ * drops it when lateness exceeds `maxLatenessMs` (0 = unlimited).
+ */
+export function decideCatchUp(job, cfg, now) {
+  const scheduledAt = Date.parse(job.nextRunAt)
+  const latenessMs = now - scheduledAt
+  const policy = job.catchUpPolicy ?? cfg.catchUpPolicy
+  if (policy === 'skip' && cfg.maxLatenessMs > 0 && latenessMs > cfg.maxLatenessMs) {
+    return { action: 'skip', latenessMs }
+  }
+  return { action: 'fire', latenessMs }
+}
+
+/**
+ * Fold one run result into a job (pure): updates last-run fields, failure
+ * counter, next occurrence, and auto-pauses (circuit breaker) once
+ * consecutive failures reach `maxConsecutiveFailures`.
+ */
+export function applyRunResult(job, result, cfg, completedAt) {
+  const succeeded = result.status === 'succeeded'
+  const consecutiveFailures = succeeded ? 0 : (job.consecutiveFailures ?? 0) + 1
+  const tripped = !succeeded && consecutiveFailures >= cfg.maxConsecutiveFailures
+  const paused = job.state === 'paused' || job.enabled === false
+  const next = paused ? (job.nextRunAt ? Date.parse(job.nextRunAt) : null) : computeNextRun(job, Date.now())
+  let state = job.state
+  if (tripped) state = 'paused'
+  else if (next === null && job.trigger.kind === 'once') state = 'completed'
+  return {
+    ...job,
+    lastRunAt: completedAt,
+    lastStatus: result.status,
+    runCount: (job.runCount ?? 0) + 1,
+    consecutiveFailures,
+    nextRunAt: next ? new Date(next).toISOString() : null,
+    state,
+    enabled: tripped ? false : job.enabled,
+    pausedReason: tripped ? 'max_consecutive_failures' : (job.pausedReason ?? undefined),
+    updatedAt: completedAt,
+  }
+}
+
+/** Render the followup text delivered into a target session. */
+export function renderDelivery(job, run) {
+  const lines = [
+    `【dsh-scheduler】定时任务「${job.name}」执行${run.status === 'succeeded' ? '完成' : '失败'}（${run.status}）`,
+    `- 触发: ${run.scheduledFor}（${run.triggerKind === 'manual' ? '手动' : '定时'}）`,
+  ]
+  if (run.durationMs !== undefined) lines.push(`- 耗时: ${(run.durationMs / 1000).toFixed(1)}s`)
+  if (run.exitCode !== undefined) lines.push(`- exit: ${run.exitCode}`)
+  if (run.error) lines.push(`- 错误: ${run.error}`)
+  if (run.outputHead) lines.push('', '```', String(run.outputHead).slice(0, 2000), '```')
+  return lines.join('\n')
+}
+
 /** Validate a job payload (create/update), returns normalized job fields. */
-function normalizeJob(input, existing) {
+export function normalizeJob(input, existing) {
   if (!input || typeof input !== 'object') throw new Error('invalid job payload')
   const name = String(input.name ?? existing?.name ?? '').trim()
   const prompt = String(input.prompt ?? existing?.prompt ?? '').trim()
@@ -155,7 +226,24 @@ function normalizeJob(input, existing) {
   const trigger = normalizeTrigger(input.trigger ?? existing?.trigger)
   const workspace = String(input.workspace ?? existing?.workspace ?? '').trim()
   const enabled = input.enabled !== undefined ? Boolean(input.enabled) : (existing?.enabled ?? true)
-  return { name, prompt, trigger, workspace, enabled }
+  // deliverTo: { sessionId } or null to clear; undefined keeps the existing value.
+  let deliverTo = existing?.deliverTo
+  if (input.deliverTo !== undefined) {
+    const raw = input.deliverTo
+    deliverTo = raw && typeof raw === 'object' && typeof raw.sessionId === 'string' && raw.sessionId.trim() !== ''
+      ? { sessionId: raw.sessionId.trim() }
+      : null
+  }
+  // catchUpPolicy: per-job override of the global policy; undefined keeps existing.
+  let catchUpPolicy = existing?.catchUpPolicy
+  if (input.catchUpPolicy !== undefined) {
+    catchUpPolicy = input.catchUpPolicy === 'skip' || input.catchUpPolicy === 'run_once' ? input.catchUpPolicy : undefined
+  }
+  return {
+    name, prompt, trigger, workspace, enabled,
+    ...(deliverTo ? { deliverTo } : {}),
+    ...(catchUpPolicy ? { catchUpPolicy } : {}),
+  }
 }
 
 // ---- cordis plugin ----------------------------------------------------------
@@ -205,28 +293,51 @@ export function apply(ctx, config) {
     inflight.set(job.id, runId)
     const run = { id: runId, jobId: job.id, triggerKind, scheduledFor, status: 'running', startedAt }
     store.appendRun(run)
+    ctx.logger.info(`[dsh-scheduler] fire job "${job.name}" (${job.id}) run=${runId} trigger=${triggerKind}`)
 
     const workspace = job.workspace || cfg.defaultWorkspace
     try { mkdirSync(workspace, { recursive: true }) } catch { /* spawn will fail with a clear error */ }
     const startedMs = Date.now()
     let output = ''
-    let killed = false
+    let settled = false
+    let timedOut = false
+
+    // Timeout escalation: SIGTERM at timeoutMs, SIGKILL after killGraceMs.
+    const killTimers = { term: undefined, kill: undefined }
+    const clearKillTimers = () => {
+      clearTimeout(killTimers.term)
+      clearTimeout(killTimers.kill)
+    }
+    killTimers.term = setTimeout(() => {
+      if (settled) return
+      timedOut = true
+      ctx.logger.warn(`[dsh-scheduler] run ${runId} timed out after ${cfg.timeoutMs}ms; SIGTERM sent`)
+      child.kill('SIGTERM')
+      killTimers.kill = setTimeout(() => {
+        if (settled) return
+        ctx.logger.warn(`[dsh-scheduler] run ${runId} still alive ${cfg.killGraceMs}ms after SIGTERM; SIGKILL sent`)
+        child.kill('SIGKILL')
+      }, cfg.killGraceMs)
+    }, cfg.timeoutMs)
 
     const child = spawn(process.execPath, [...defaultEntry.args, '--profile', 'headless', job.prompt], {
       cwd: workspace,
       env: process.env,
       stdio: ['ignore', 'pipe', 'pipe'],
-      timeout: cfg.timeoutMs,
     })
     child.stdout.on('data', (d) => { output = tail(output + d.toString('utf8')) })
     child.stderr.on('data', (d) => { output = tail(output + d.toString('utf8')) })
     child.on('error', (error) => {
-      killed = true
+      if (settled) return
+      clearKillTimers()
       finish({ status: 'failed', error: `spawn: ${renderThrown(error)}` })
     })
     child.on('close', (code, signal) => {
-      if (killed) return
-      if (signal) {
+      if (settled) return
+      clearKillTimers()
+      if (timedOut) {
+        finish({ status: 'failed', exitCode: code ?? -1, error: `timeout after ${Math.round(cfg.timeoutMs / 1000)}s` })
+      } else if (signal) {
         finish({ status: 'failed', error: `killed by ${signal}` })
       } else if (code === 0) {
         finish({ status: 'succeeded', exitCode: 0 })
@@ -236,6 +347,7 @@ export function apply(ctx, config) {
     })
 
     function finish(result) {
+      settled = true
       if (!inflight.has(job.id) || inflight.get(job.id) !== runId) return
       inflight.delete(job.id)
       const completedAt = nowIso()
@@ -246,25 +358,49 @@ export function apply(ctx, config) {
         outputHead: output,
         completedAt,
       }
+      const delivery = deliver(job, finalRun)
+      if (delivery) finalRun.delivery = delivery
       store.appendRun(finalRun)
+      ctx.logger.info(
+        `[dsh-scheduler] run ${runId} ${result.status} for job "${job.name}" (${job.id})`
+        + ` in ${((Date.now() - startedMs) / 1000).toFixed(1)}s${delivery ? ` delivery=${delivery.status}` : ''}`,
+      )
 
       const live = store.getJob(job.id)
       if (live) {
-        const succeeded = result.status === 'succeeded'
-        const paused = live.state === 'paused' || live.enabled === false
-        const next = paused ? (live.nextRunAt ? Date.parse(live.nextRunAt) : null) : computeNextRun(live, Date.now())
-        store.upsertJob({
-          ...live,
-          lastRunAt: completedAt,
-          lastStatus: result.status,
-          runCount: (live.runCount ?? 0) + 1,
-          consecutiveFailures: succeeded ? 0 : (live.consecutiveFailures ?? 0) + 1,
-          nextRunAt: next ? new Date(next).toISOString() : null,
-          state: next === null && live.trigger.kind === 'once' ? 'completed' : live.state,
-          updatedAt: completedAt,
-        })
+        const updated = applyRunResult(live, result, cfg, completedAt)
+        store.upsertJob(updated)
+        if (updated.state === 'paused' && updated.pausedReason === 'max_consecutive_failures') {
+          ctx.logger.warn(
+            `[dsh-scheduler] job "${job.name}" (${job.id}) auto-paused after `
+            + `${updated.consecutiveFailures} consecutive failures (max ${cfg.maxConsecutiveFailures})`,
+          )
+        }
       }
       scheduleWake()
+    }
+  }
+
+  /** Deliver the run outcome into the job's target session (live root agent). */
+  function deliver(job, run) {
+    const target = job.deliverTo?.sessionId
+    if (!target) return undefined
+    try {
+      const agent = ctx.agents.get(target)
+      const isRoot = agent !== undefined && ctx.agents.roots().includes(agent)
+      if (!isRoot) {
+        ctx.logger.warn(`[dsh-scheduler] delivery skipped: target session ${target} not live`)
+        return { status: 'skipped', reason: 'target session not live' }
+      }
+      const message = createUserMessage({
+        content: [{ type: 'text', text: renderDelivery(job, run) }],
+        source: { kind: 'plugin', plugin: 'dsh-scheduler' },
+      })
+      agent.followup(message)
+      return { status: 'delivered', sessionId: target }
+    } catch (error) {
+      ctx.logger.warn(`[dsh-scheduler] delivery failed: ${renderThrown(error)}`)
+      return { status: 'error', reason: renderThrown(error) }
     }
   }
 
@@ -279,9 +415,27 @@ export function apply(ctx, config) {
       const jobs = store.loadJobs()
       for (const job of jobs) {
         if (job.enabled === false || job.state === 'paused' || job.state === 'completed') continue
-        if (job.nextRunAt && Date.parse(job.nextRunAt) <= now) {
-          runJob(job, 'scheduled', job.nextRunAt)
+        if (!job.nextRunAt || Date.parse(job.nextRunAt) > now) continue
+        const decision = decideCatchUp(job, cfg, now)
+        if (decision.action === 'skip') {
+          const next = computeNextRun(job, now)
+          store.appendRun({
+            id: newId('run'), jobId: job.id, triggerKind: 'scheduled', scheduledFor: job.nextRunAt,
+            status: 'skipped', startedAt: nowIso(), completedAt: nowIso(),
+            error: `catch-up skipped (late by ${Math.round(decision.latenessMs / 1000)}s > ${Math.round(cfg.maxLatenessMs / 1000)}s)`,
+          })
+          store.upsertJob({
+            ...job,
+            nextRunAt: next ? new Date(next).toISOString() : null,
+            updatedAt: nowIso(),
+          })
+          ctx.logger.info(
+            `[dsh-scheduler] job "${job.name}" (${job.id}) missed occurrence skipped `
+            + `(late by ${Math.round(decision.latenessMs / 1000)}s, max ${Math.round(cfg.maxLatenessMs / 1000)}s)`,
+          )
+          continue
         }
+        runJob(job, 'scheduled', job.nextRunAt)
       }
     } finally {
       store.releaseLock()
@@ -305,6 +459,12 @@ export function apply(ctx, config) {
   }
 
   function start() {
+    ctx.logger.info(
+      `[dsh-scheduler] started: dataDir=${cfg.dataDir} cli=${defaultEntry.source} `
+      + `maxConcurrent=${cfg.maxConcurrent} timeout=${Math.round(cfg.timeoutMs / 1000)}s `
+      + `killGrace=${Math.round(cfg.killGraceMs / 1000)}s breaker=${cfg.maxConsecutiveFailures} `
+      + `catchUp=${cfg.catchUpPolicy}${cfg.catchUpPolicy === 'skip' ? ` maxLateness=${Math.round(cfg.maxLatenessMs / 1000)}s` : ''}`,
+    )
     tick()
     tickTimer = setInterval(() => tick(), cfg.tickMs)
   }
@@ -346,7 +506,11 @@ export function apply(ctx, config) {
       cliEntry: defaultEntry.source,
       maxConcurrent: cfg.maxConcurrent,
       timeoutMs: cfg.timeoutMs,
+      killGraceMs: cfg.killGraceMs,
       tickMs: cfg.tickMs,
+      maxConsecutiveFailures: cfg.maxConsecutiveFailures,
+      catchUpPolicy: cfg.catchUpPolicy,
+      maxLatenessMs: cfg.maxLatenessMs,
     })
   }
 

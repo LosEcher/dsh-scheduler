@@ -82,6 +82,9 @@ DSH 内置 `@deepseek-ai/dsh-schedule`（`packages/schedule/schedule`），它�
   "workspace": "/Users/echerlos/syncthing/project/dsfolder",  // headless 运行 cwd
   "enabled": true,
   "state": "scheduled",             // scheduled | paused | completed(once 已触发)
+  "deliverTo": { "sessionId": "session-..." },  // 可选：运行结果 followup 进该会话（须在线）
+  "catchUpPolicy": "run_once",      // 可选：'run_once'(错过补跑) | 'skip'(超时差跳过)；缺省跟随全局
+  "pausedReason": null,             // 熔断自动暂停时 = 'max_consecutive_failures'
   "nextRunAt": "2026-08-16T01:00:00.000Z",
   "lastRunAt": null,
   "lastStatus": null,               // succeeded | failed | skipped
@@ -97,17 +100,18 @@ DSH 内置 `@deepseek-ai/dsh-schedule`（`packages/schedule/schedule`），它�
 { "id": "run-...", "jobId": "job-...", "triggerKind": "scheduled" | "manual",
   "scheduledFor": "...", "status": "queued"|"running"|"succeeded"|"failed"|"skipped"|"cancelled",
   "exitCode": 0, "durationMs": 1234, "outputHead": "...(尾部 8KB)",
+  "delivery": { "status": "delivered"|"skipped"|"error", "sessionId": "...", "reason": "..." },
   "sessionDir": "...", "startedAt": "...", "completedAt": "..." }
 ```
 
 ### 2.3 调度循环
 
 - `tick()`（60s 周期 + 每次任务变更后立即重算）：对每个 `enabled && nextRunAt <= now` 的任务：
+  - 先过**追赶策略**（`decideCatchUp`，纯函数）：`run_once`（默认）→ 无论迟到多久补跑一次；`skip` → 迟到超过 `maxLatenessMs`（默认 15min，0=不限）则跳过本次并重算 nextRunAt，台账记 `skipped`；
   - 并发已达上限 → 记一条 `skipped` 台账，`nextRunAt` 顺延到下一次（不追赶）；
   - 否则 spawn 执行，`nextRunAt` 重算（cron → 下一次匹配；interval → now + every；once → null + state=completed）；
 - 精确唤醒：arm `setTimeout` 到最早 `nextRunAt`（max 2^31-1 ms 分段），唤醒后重新 tick；
-- `.tick.lock`：mkdir 原子获取，web 重启交叠期间防双触发；异常退出遗留锁由 mtime 超时回收；
-- 过期任务（web 停机期间错过触发）策略：**run_once 追赶**（hermes/los 默认同款），tick 时 `nextRunAt <= now` 即视为到期执行一次。
+- `.tick.lock`：mkdir 原子获取，web 重启交叠期间防双触发；异常退出遗留锁由 mtime 超时回收。
 
 ### 2.4 执行（executor）
 
@@ -115,24 +119,26 @@ DSH 内置 `@deepseek-ai/dsh-schedule`（`packages/schedule/schedule`），它�
 spawn(process.execPath,
   ['--import', <harness>/node_modules/tsx/esm, <harness>/apps/cli/src/bin.ts,
    '--profile', 'headless', prompt],
-  { cwd: job.workspace, env: {...process.env, DSH_HOME}, timeout: jobTimeoutMs })
+  { cwd: job.workspace, env: process.env })
 ```
 
 - 优先用 `apps/cli/lib/bin.js`（若已构建，免 tsx），否则走 tsx 源码入口；
-- 超时（默认 30min，可配）→ kill → 台账记 `failed` + `error: timeout`；
+- **超时升级**：`timeoutMs`（默认 30min）到点发 SIGTERM，再等 `killGraceMs`（默认 10s）仍不退则 SIGKILL；台账记 `failed` + `error: timeout after Ns`；
 - 输出捕获：stdout/stderr 合并尾部 8KB 入台账 `outputHead`；
-- 退出码 0 → `succeeded`，非 0 → `failed`（连续失败计数供 UI 提示）；
-- `harnessDir` 配置：env `DSH_HARNESS_DIR` → 默认 `/Users/echerlos/Downloads/projects/deepseek-harness`。
+- 退出码 0 → `succeeded`，非 0 → `failed`；
+- **熔断**：连续失败达到 `maxConsecutiveFailures`（默认 5）→ 自动暂停（`enabled=false, state=paused, pausedReason=max_consecutive_failures`），UI 显示「已熔断暂停」，手动恢复后重新计数；
+- **结果投递**：任务配置 `deliverTo.sessionId` 时，运行结束后把结果摘要（renderDelivery）以 `createUserMessage` + `agent.followup` 注入该会话（须是本 web 实例的 live root agent）；目标不在线则台账记 `delivery.skipped`；
+- `harnessDir` 配置：env `DSH_HARNESS_DIR` → 默认 `/Users/echerlos/Downloads/projects/deepseek-harness`；`defaultWorkspace` 兜底为 `homedir()`（env `DSH_SCHEDULER_WORKSPACE` 优先）。
 
 ### 2.5 REST API（同源 /scheduler）
 
 | 方法 | 路径 | 说明 |
 |---|---|---|
-| GET | `/scheduler/status` | 运行时状态（tick、锁、在飞任务、任务数） |
+| GET | `/scheduler/status` | 运行时状态（tick、锁、在飞任务、熔断/追赶配置） |
 | GET | `/scheduler/jobs` | 任务列表 |
 | POST | `/scheduler/jobs` | 创建任务（校验 + 重算 nextRunAt） |
 | GET | `/scheduler/jobs/:id` | 单个任务 |
-| PATCH | `/scheduler/jobs/:id` | 更新（name/prompt/trigger/workspace/enabled） |
+| PATCH | `/scheduler/jobs/:id` | 更新（name/prompt/trigger/workspace/enabled/deliverTo/catchUpPolicy） |
 | DELETE | `/scheduler/jobs/:id` | 删除（含台账） |
 | POST | `/scheduler/jobs/:id/trigger` | 手动触发一次（triggerKind=manual） |
 | POST | `/scheduler/jobs/:id/pause` / `/resume` | 暂停 / 恢复 |
@@ -142,7 +148,12 @@ spawn(process.execPath,
 ### 2.6 管理页面（client 半包）
 
 - 注册 `conversation.view` slot（id=`scheduler`，label=`定时任务`，order 96）；
-- 功能：运行时状态条 / 任务列表（下次触发、上次状态、运行次数、操作）/ 新建+编辑表单（触发预设：cron 表达式 / 间隔 / 一次性 + 时区 + 工作区 + 实时「未来 5 次触发」预览）/ 手动触发 / 暂停恢复 / 删除 / 运行台账（状态、耗时、退出码、输出尾部可展开）。
+- 功能：运行时状态条（tick/在飞/任务数/**熔断阈值/追赶策略**）/ 任务列表（下次触发、上次状态、投递目标、运行次数、**熔断暂停标记**、操作）/ 新建+编辑表单（触发预设：cron / 间隔 / 一次性 + 时区 + 工作区 + **deliverTo 会话** + **追赶策略** + 实时「未来 5 次触发」预览）/ 手动触发 / 暂停恢复 / 删除 / 运行台账（状态、耗时、退出码、**投递状态徽标**、输出尾部可展开）。
+
+### 2.7 运行日志
+
+宿主 `ctx.logger` 打点（web 日志 `~/.dsh/logs/dsh-web.log`，前缀 `[dsh-scheduler]`）：
+启动配置摘要（info）/ 每次 fire（info，含 run id）/ 每次 finish（info，状态+耗时+投递结果）/ 超时与 SIGKILL 升级（warn）/ 熔断自动暂停（warn）/ 投递跳过或失败（warn）。
 
 ## 三、安装
 
@@ -181,7 +192,14 @@ failed to apply loader entry dsh-scheduler:
    错误在这里就会暴露，而不是等热重载把整棵树拉起来。
 4. 新增 bundle 行的 `config: {}` 意味着**所有字段默认值都会被实际使用**——默认值必须是合法字面量。
 
+**插件内 import `@deepseek-ai/*` 的解析坑**：宿主 loader 以 profile 目录为解析基座，profile
+node_modules 里只有 `@deepseek-ai/cordis` / `schemastery` 等少量包；dsplugins 里的插件若要
+import 其他 `@deepseek-ai/*`（如本插件的 `@deepseek-ai/dsh-llm` 取 `createUserMessage`），
+需在插件目录建 `node_modules/@deepseek-ai/<pkg>` 符号链接指向 harness 对应包
+（`packages/llm/llm` 等，dsh-channel-wechat 同款做法；链接已入 .gitignore 不进仓库）。
+判断依赖是否可解析：`node -e "import('@deepseek-ai/<pkg>')"` 在插件目录直接验证。
+
 ## 四、边界与后续
 
-- v1 执行面为 headless 进程：每次运行约 5s 启动成本、无 web 会话内的可见性（台账承载结果）；
-- 后续可选：`deliverTo`（结果投递到指定会话/IM）、cron 表达式描述、每任务模型/提供方覆盖、审批策略（los 同款）、systemd/launchd 平台调度器（cantool 同款）。
+- v1 执行面为 headless 进程：每次运行约 5s 启动成本、无 web 会话内的可见性（台账 + deliverTo 承载结果）；
+- 后续可选：deliverTo 扩展 IM 渠道投递（对接 channel 插件）、cron 表达式描述、每任务模型/提供方覆盖、审批策略（los 同款）、systemd/launchd 平台调度器（cantool 同款）。
