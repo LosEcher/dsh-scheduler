@@ -26,6 +26,48 @@
 6h、NAS34 drift 6h）；②数据分析（surge log error 6h、network-observe daily 09:00）；
 ③投递（daily execution digest WeChat 08:30）。
 
+## 0.5 源码与数据库纵深（2026-08-15 补充）
+
+**存储层**：PostgreSQL（`127.0.0.1:55432/los`，`DATABASE_URL` 在 los 仓库 `.env`）。两表：
+
+- `scheduled_work_items`：id/status/`trigger_json`/`run_template_json`/approval_policy/
+  approval_timeout_ms/approval_timeout_action/concurrency_policy/catch_up_policy/
+  max_concurrent_runs/max_lateness_ms(默认 1h)/max_attempts(默认 2)/retry_backoff_ms(默认 60s)/
+  failure_threshold(默认 3)/next_run_at/`circuit_state`(closed|open|half_open)/circuit_opened_at/
+  consecutive_failures/consecutive_no_ops/`recovery_work_item_id`/revision/metadata_json
+- `scheduled_work_item_runs`：id/schedule_id/scheduled_for/trigger_kind(scheduled|manual|retry)/
+  status(9 态)/attempt_count/max_attempts/`claim_owner`/`lease_expires_at`/`work_item_id`/run_spec_id/
+  task_run_id/result_summary_json/error + `UNIQUE(schedule_id, scheduled_for)`
+
+**库内真实数据（2749 runs）**：succeeded 2045 / no_op 581 / skipped 73 / failed 31 /
+cancelled 18 / awaiting_approval 1；**76% (2080) 关联 `work_item_id`(todos)**，61 关联 task_run_id；
+`claim_owner = gateway-echers-mbp-local-8080`（网关实例标识）；no_op 运行 **10ms 完成**
+（readiness 快路径无 LLM 调用）；goalTemplate 为**自包含 prompt**（环境事实+步骤+输出契约
+JSON+requiredChecks+editableSurfaces）；result_summary_json 为结构化 JSON（如 fleet 检查返回
+逐节点 unit/health/listen/mem 明细）。
+
+**执行机制（源码）**：
+- runner.ts：启动 2s 首 tick + `setInterval(intervalMs)`，single-flight（running 标志防重入）；
+  两步认领：短 claim lease（`claimQueuedScheduledWorkRuns`）→ 执行时升级为长 execution lease +
+  **heartbeat 防 reaper 误回收**（执行面=gateway 进程内 agent，`maxLoops` 有界）
+- policy.ts：`shouldSkipLateRun = catchUp==='skip' && lateness > maxLatenessMs`（与 dsh 同构）；
+  interval 语法 `Nm|Nh|Nd`，**下限 5min 上限 31d**（dsh 下限 60s 更宽）
+- executeTemplate 按 `templateId` 分发：scheduled_execution（通用 agent 执行：goalTemplate+
+  maxLoops+toolMode+editableSurfaces）与特化 handler（runtime_readiness/fleet_host_check/
+  morning_inbox_digest/daily_execution_digest/scheduled_feed_analysis）
+- 熔断：failure_threshold=3 开断 → 生成 `recovery_work_item_id`（恢复性工作项，half_open 试探）
+- retry：attempt_count/max_attempts=2 + retry_backoff_ms=60s，重试 run `trigger_kind='retry'`
+
+**对 dsh 的启示**：
+1. los 的 claim/lease/heartbeat 是**多网关/多实例**设计（reaper 回收过期 lease）；DSH 单 web
+   实例 + headless 执行，`.tick.lock`（mkdir+mtime 回收）已是等价简化，**无需引入 lease 体系**
+2. los 的 no_op 在 handler 层判定（快路径 10ms 无 LLM）；DSH headless 每次必有 LLM 调用，
+   no_op 语义应为「输出匹配 [SILENT]/空」——判定点不同，迁移时按 DSH 语义实现
+3. los 的 `retry_backoff_ms` 与 `trigger_kind='retry'` 是 dsh maxAttempts 迁移的直接蓝本
+4. goalTemplate 结构（环境事实+步骤+输出契约 JSON）可直接作为 dsh「任务模板预设」设计蓝本
+5. DB 是真源、页面读 API；**DSH 监督看板应读 API**（与页面同源，避免直连 DB 的耦合）
+6. interval 下限差异：los 5min vs dsh 60s——监督/迁移场景注意语义对齐
+
 ## 1. 可合理迁移到 dsh（dsh-scheduler 补齐，按价值排序）
 
 | # | 能力 | los 依据 | dsh 现状 | 迁移建议 |
