@@ -10,6 +10,7 @@
 /** Locale keys this tab renders. */
 export type SchedulerKey =
   | 'tabTitle'
+  | 'statusInflightBadge' | 'close'
   | 'statusTick' | 'statusInflight' | 'statusJobs' | 'statusBreaker' | 'statusCatchUp'
   | 'refresh' | 'newJob'
   | 'newJobTitle' | 'editJobTitle'
@@ -43,6 +44,8 @@ export type SchedulerKey =
 /** English copy. */
 export const en: Record<SchedulerKey, string> = {
   tabTitle: 'Scheduled jobs',
+  statusInflightBadge: '{count} job(s) running',
+  close: 'Close',
   statusTick: 'tick: {time}',
   statusInflight: 'inflight: {inflight}/{max}',
   statusJobs: 'jobs: {enabled}/{total} enabled',
@@ -135,6 +138,8 @@ export const en: Record<SchedulerKey, string> = {
 /** Simplified Chinese copy. */
 export const zh: Record<SchedulerKey, string> = {
   tabTitle: '定时任务',
+  statusInflightBadge: '{count} 个任务运行中',
+  close: '关闭',
   statusTick: 'tick: {time}',
   statusInflight: '在飞: {inflight}/{max}',
   statusJobs: '任务: {enabled}/{total} 启用',

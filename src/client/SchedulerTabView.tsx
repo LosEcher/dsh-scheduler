@@ -19,7 +19,7 @@
  */
 
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
-import type { PropsLocale, PropsRuntime } from '@deepseek-ai/dsh-client-ui-slots'
+import type { PropsLocale } from '@deepseek-ai/dsh-client-ui-slots'
 import { Button, IconTrashOutline16, Modal } from '@deepseek-ai/dsh-client-ui-primitives'
 import type {} from '@deepseek-ai/dsh-client-ui-conversation/client'
 import type {} from './locales.ts'
@@ -81,7 +81,7 @@ interface Status {
 type ConfirmKind = 'delete' | 'pause' | 'resume' | 'trigger'
 
 /** Props delivered by the slot outlet: runtime share + locale seat. */
-export type SchedulerTabViewProps = PropsRuntime<'conversation.view'> & PropsLocale<typeof import('./locales.ts').NS>
+export type SchedulerTabViewProps = PropsLocale<typeof import('./locales.ts').NS>
 
 // ---- api helpers ----
 
