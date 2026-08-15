@@ -108,6 +108,16 @@
 }
 .scRunItem { margin-bottom: 6px; font-size: 12px; }
 .scRunSummary { cursor: pointer; }
+/* Task Rows 风格：输出尾部单行截断（beautifului 参考） */
+.scRunTail {
+  font-size: 11px;
+  color: var(--dsw-alias-label-tertiary);
+  max-width: 320px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-family: var(--dsw-font-family, ui-monospace, monospace);
+}
 .scRunError {
   color: color-mix(in srgb, var(--dsw-alias-state-error-primary) 55%, var(--dsw-alias-label-primary));
   white-space: pre-wrap;

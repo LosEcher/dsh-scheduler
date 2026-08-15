@@ -134,6 +134,29 @@ export function SchedulerTabView({ t }: SchedulerTabViewProps) {
     }
   }, [t])
 
+  /** 相对时间（Task Rows 风格）：<1m → '刚刚'，<1h → 'Nm ago'，<24h → 'Nh ago'，否则绝对日期 */
+  const relTime = useCallback((iso: string | null | undefined): string => {
+    if (!iso) return t('emptyDate')
+    const ts = new Date(iso).getTime()
+    if (Number.isNaN(ts)) return iso
+    const diff = Date.now() - ts
+    if (diff < 60_000) return t('justNow')
+    const m = Math.floor(diff / 60_000)
+    if (m < 60) return t('minAgo', { n: m })
+    const h = Math.floor(m / 60)
+    if (h < 24) return t('hourAgo', { n: h })
+    const d = Math.floor(h / 24)
+    if (d < 7) return t('dayAgo', { n: d })
+    return new Date(ts).toLocaleDateString('zh-CN')
+  }, [t])
+
+  /** 输出尾部首行（单行截断，Task Rows 风格） */
+  const outputTail = useCallback((head: string | undefined): string => {
+    if (!head) return ''
+    const line = head.split('\n')[0].trim()
+    return line.length > 80 ? `${line.slice(0, 80)}…` : line
+  }, [])
+
   const triggerKindLabel = useCallback((kind: TriggerKind): string => {
     if (kind === 'cron') return t('triggerKindCron')
     if (kind === 'interval') return t('triggerKindInterval')
@@ -409,7 +432,6 @@ export function SchedulerTabView({ t }: SchedulerTabViewProps) {
                       <span className={css.scRow}>
                         <StatusBadge state={r.status === 'succeeded' ? 'ok' : r.status === 'failed' ? 'bad' : 'neutral'}>{r.status}</StatusBadge>
                         <span className={css.scMuted}>{r.triggerKind === 'manual' ? t('runManual') : t('runScheduled')}</span>
-                        <span className={css.scMuted}>{t('triggeredAt', { time: fmt(r.scheduledFor) })}</span>
                         {r.durationMs !== undefined ? <span className={css.scMuted}>{t('duration', { s: (r.durationMs / 1000).toFixed(1) })}</span> : null}
                         {r.exitCode !== undefined ? <span className={css.scMuted}>{t('exitCode', { code: r.exitCode })}</span> : null}
                         {r.delivery
@@ -418,7 +440,13 @@ export function SchedulerTabView({ t }: SchedulerTabViewProps) {
                             </StatusBadge>
                           : null}
                         <span className={css.scSpacer} />
-                        <span className={css.scMuted}>{fmt(r.completedAt ?? r.startedAt)}</span>
+                        {/* Task Rows 风格：相对时间 + title 全时间戳；输出尾部单行截断 */}
+                        <span className={css.scRunTail} title={r.outputHead ?? undefined}>
+                          {outputTail(r.outputHead) || t('noOutput')}
+                        </span>
+                        <span className={css.scMuted} title={fmt(r.completedAt ?? r.startedAt)}>
+                          {relTime(r.completedAt ?? r.startedAt)}
+                        </span>
                       </span>
                     </summary>
                     {r.error ? <pre className={css.scRunError}>{r.error}</pre> : null}

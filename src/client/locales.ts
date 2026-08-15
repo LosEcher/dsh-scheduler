@@ -33,7 +33,7 @@ export type SchedulerKey =
   | 'collapseHistory' | 'runHistory' | 'noRuns'
   | 'runManual' | 'runScheduled' | 'triggeredAt' | 'duration' | 'exitCode'
   | 'deliveredTo' | 'deliveryStatus' | 'noOutput'
-  | 'emptyDate'
+  | 'emptyDate' | 'justNow' | 'minAgo' | 'hourAgo' | 'dayAgo'
   | 'deleteConfirmTitle' | 'deleteConfirmBody'
   | 'pauseConfirmTitle' | 'pauseConfirmBody'
   | 'resumeConfirmTitle' | 'resumeConfirmBody'
@@ -114,6 +114,10 @@ export const en: Record<SchedulerKey, string> = {
   deliveryStatus: 'delivery: {status}',
   noOutput: '(no output)',
   emptyDate: '—',
+  justNow: 'just now',
+  minAgo: '{n}m ago',
+  hourAgo: '{n}h ago',
+  dayAgo: '{n}d ago',
   deleteConfirmTitle: 'Delete job',
   deleteConfirmBody: 'Delete job "{name}"? Its run ledger will be deleted too.',
   pauseConfirmTitle: 'Pause job',
@@ -202,6 +206,10 @@ export const zh: Record<SchedulerKey, string> = {
   deliveryStatus: '投递:{status}',
   noOutput: '（无输出）',
   emptyDate: '—',
+  justNow: '刚刚',
+  minAgo: '{n} 分钟前',
+  hourAgo: '{n} 小时前',
+  dayAgo: '{n} 天前',
   deleteConfirmTitle: '删除任务',
   deleteConfirmBody: '删除任务「{name}」？运行台账将一并删除。',
   pauseConfirmTitle: '暂停任务',
