@@ -12,7 +12,7 @@
   },
   "scripts": {
     "build": "node scripts/build.mjs",
-    "test": "node --test 'test/*.test.mjs'"
+    "test": "node --preserve-symlinks --test 'test/*.test.mjs'"
   },
   "files": ["index.mjs", "cordis.patch.yml", "lib/client.js", "lib/cron-next.mjs", "lib/store.mjs", "README.md"],
   "license": "MIT",

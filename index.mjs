@@ -31,13 +31,19 @@ import { parseCron, nextCronAfter, cronOccurrences, parseInterval, CronParseErro
 export const name = 'dsh-scheduler'
 export const inject = ['webServer']
 
+// schemastery `.default()` stores the argument AS-IS (a literal): a factory
+// function would fail Cordis string validation and take down the whole web
+// plugin tree. Following the harness convention (settings-file: "defaulting
+// happens here, never inline"): string fields stay default-less in the schema
+// and env-derived values are resolved at runtime in resolveConfig(); number
+// fields may carry literal defaults (retry-policy precedent).
 export const Config = Schema.object({
-  /** Storage root for jobs.json / runs.jsonl / lock. */
-  dataDir: Schema.string().default(() => `${process.env.DSH_HOME ?? `${homedir()}/.dsh`}/storages/dsh-scheduler`),
-  /** Harness checkout root: dsh CLI entry + tsx live here. */
-  harnessDir: Schema.string().default(() => process.env.DSH_HARNESS_DIR ?? '/Users/echerlos/Downloads/projects/deepseek-harness'),
-  /** Default workspace (cwd) for jobs that do not pin one. */
-  defaultWorkspace: Schema.string().default(() => process.env.DSH_SCHEDULER_WORKSPACE ?? process.cwd()),
+  /** Storage root for jobs.json / runs.jsonl / lock (optional; resolved at runtime). */
+  dataDir: Schema.string(),
+  /** Harness checkout root: dsh CLI entry + tsx live here (optional). */
+  harnessDir: Schema.string(),
+  /** Default workspace (cwd) for jobs that do not pin one (optional). */
+  defaultWorkspace: Schema.string(),
   /** Per-run timeout before the headless process is killed. */
   timeoutMs: Schema.number().min(10_000).default(30 * 60_000),
   /** Max concurrent headless runs. */
@@ -45,6 +51,19 @@ export const Config = Schema.object({
   /** Periodic tick interval (drift/overdue catch-up). */
   tickMs: Schema.number().min(5_000).default(60_000),
 }).description('dsh-scheduler: DSH 定时任务（cron/interval/once + headless 执行 + 台账）')
+
+/** Resolve runtime config: explicit values win, env falls back, then defaults. */
+function resolveConfig(config) {
+  const dshHome = process.env.DSH_HOME ?? `${homedir()}/.dsh`
+  return {
+    dataDir: config.dataDir ?? `${dshHome}/storages/dsh-scheduler`,
+    harnessDir: config.harnessDir ?? process.env.DSH_HARNESS_DIR ?? '/Users/echerlos/Downloads/projects/deepseek-harness',
+    defaultWorkspace: config.defaultWorkspace ?? process.env.DSH_SCHEDULER_WORKSPACE ?? process.cwd(),
+    timeoutMs: config.timeoutMs ?? 30 * 60_000,
+    maxConcurrent: config.maxConcurrent ?? 2,
+    tickMs: config.tickMs ?? 60_000,
+  }
+}
 
 const MAX_TIMER_DELAY_MS = 2_147_483_647
 const OUTPUT_TAIL_BYTES = 8192
@@ -142,14 +161,15 @@ function normalizeJob(input, existing) {
 // ---- cordis plugin ----------------------------------------------------------
 
 export function apply(ctx, config) {
-  const store = new Store(config.dataDir)
+  const cfg = resolveConfig(config)
+  const store = new Store(cfg.dataDir)
   const inflight = new Map() // jobId -> runId
   let tickTimer
   let wakeTimer
   let lastTickAt = null
   let stopping = false
 
-  const defaultEntry = resolveCliEntry(config.harnessDir)
+  const defaultEntry = resolveCliEntry(cfg.harnessDir)
 
   function resolveCliEntry(harnessDir) {
     const bundled = join(harnessDir, 'apps/cli/lib/bin.js')
@@ -171,11 +191,11 @@ export function apply(ctx, config) {
       })
       return
     }
-    if (inflight.size >= config.maxConcurrent) {
+    if (inflight.size >= cfg.maxConcurrent) {
       store.appendRun({
         id: newId('run'), jobId: job.id, triggerKind, scheduledFor,
         status: 'skipped', startedAt: nowIso(), completedAt: nowIso(),
-        error: `concurrency limit (${config.maxConcurrent}) reached`,
+        error: `concurrency limit (${cfg.maxConcurrent}) reached`,
       })
       return
     }
@@ -186,7 +206,7 @@ export function apply(ctx, config) {
     const run = { id: runId, jobId: job.id, triggerKind, scheduledFor, status: 'running', startedAt }
     store.appendRun(run)
 
-    const workspace = job.workspace || config.defaultWorkspace
+    const workspace = job.workspace || cfg.defaultWorkspace
     try { mkdirSync(workspace, { recursive: true }) } catch { /* spawn will fail with a clear error */ }
     const startedMs = Date.now()
     let output = ''
@@ -196,7 +216,7 @@ export function apply(ctx, config) {
       cwd: workspace,
       env: process.env,
       stdio: ['ignore', 'pipe', 'pipe'],
-      timeout: config.timeoutMs,
+      timeout: cfg.timeoutMs,
     })
     child.stdout.on('data', (d) => { output = tail(output + d.toString('utf8')) })
     child.stderr.on('data', (d) => { output = tail(output + d.toString('utf8')) })
@@ -286,7 +306,7 @@ export function apply(ctx, config) {
 
   function start() {
     tick()
-    tickTimer = setInterval(() => tick(), config.tickMs)
+    tickTimer = setInterval(() => tick(), cfg.tickMs)
   }
 
   // ---- REST API -------------------------------------------------------------
@@ -321,12 +341,12 @@ export function apply(ctx, config) {
       inflight: [...inflight.entries()].map(([jobId, runId]) => ({ jobId, runId })),
       jobCount: jobs.length,
       enabledCount: jobs.filter((j) => j.enabled && j.state !== 'paused' && j.state !== 'completed').length,
-      dataDir: config.dataDir,
-      harnessDir: config.harnessDir,
+      dataDir: cfg.dataDir,
+      harnessDir: cfg.harnessDir,
       cliEntry: defaultEntry.source,
-      maxConcurrent: config.maxConcurrent,
-      timeoutMs: config.timeoutMs,
-      tickMs: config.tickMs,
+      maxConcurrent: cfg.maxConcurrent,
+      timeoutMs: cfg.timeoutMs,
+      tickMs: cfg.tickMs,
     })
   }
 
@@ -449,12 +469,10 @@ export function apply(ctx, config) {
       const method = req.method ?? 'GET'
       const parts = url.pathname.split('/').filter(Boolean) // [scheduler, jobs?, id?, action?]
       try {
-        if (parts.length === 1 && parts[0] === 'scheduler') {
-          if (method === 'GET' && (url.pathname === '/scheduler' || url.pathname === '/scheduler/status')) return routeStatus(r)
-          if (method === 'GET' && url.pathname === '/scheduler/jobs') return routeListJobs(r)
-          if (method === 'GET' && url.pathname === '/scheduler/preview') return routePreview(r, url)
-          if (method === 'POST' && url.pathname === '/scheduler/jobs') return routeCreateJob(r, req)
-        }
+        if (method === 'GET' && (url.pathname === '/scheduler' || url.pathname === '/scheduler/status')) return routeStatus(r)
+        if (method === 'GET' && url.pathname === '/scheduler/jobs') return routeListJobs(r)
+        if (method === 'GET' && url.pathname === '/scheduler/preview') return routePreview(r, url)
+        if (method === 'POST' && url.pathname === '/scheduler/jobs') return routeCreateJob(r, req)
         if (parts.length >= 3 && parts[0] === 'scheduler' && parts[1] === 'jobs') {
           const id = parts[2]
           const action = parts[3]

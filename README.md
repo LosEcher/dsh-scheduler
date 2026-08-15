@@ -157,6 +157,30 @@ curl -s http://127.0.0.1:3080/scheduler/status
 
 > 客户端半包改动（src/client/*）需要 `pnpm run dev:web` 的 client-hmr 或重启后重新构建 `node scripts/build.mjs`。
 
+## 三·五、配置与常见坑（2026-08-15 事故复盘）
+
+**事故**：v0.1 的 `Config` 把 env 派生默认值写成了
+`schemastery .default(() => ...)` 工厂函数。schemastery 的 `.default(value)` **原样存储参数**
+（只吃字面量，不调用函数），bundle patch 里 `config: {}` 一走默认值，Cordis 按 string 校验直接抛：
+
+```
+failed to apply loader entry dsh-scheduler:
+  $.dataDir expected string but got () => `${process.env.DSH_HOME ?? ...}`
+```
+
+配置树组合失败 → 整棵 web 插件树起不来（热重载直接命中；daemon 重启有 `--dump-config` preflight 兜底）。
+
+**规避规则（DSH 插件开发通用）**：
+
+1. **`.default()` 只放字面量**（数字如 `Schema.number().default(60_000)` 是安全的，见 harness
+   `retry-policy.ts`）；**env/运行时派生值一律不在 Schema 里默认**。
+2. 采用 harness 第一方约定（`settings-file`：*"defaulting happens here, never inline"*）：
+   Schema 字符串字段留空（可选），在 `apply(ctx, config)` 里用 `resolveConfig(config)` 做
+   `config.x ?? process.env.Y ?? 字面量` 的运行时解析（本插件 `index.mjs` 的 `resolveConfig()` 即此模式）。
+3. **改插件后先跑 daemon 同款 preflight**：`pnpm dsh --profile web --dump-config`，任何 schema
+   错误在这里就会暴露，而不是等热重载把整棵树拉起来。
+4. 新增 bundle 行的 `config: {}` 意味着**所有字段默认值都会被实际使用**——默认值必须是合法字面量。
+
 ## 四、边界与后续
 
 - v1 执行面为 headless 进程：每次运行约 5s 启动成本、无 web 会话内的可见性（台账承载结果）；
