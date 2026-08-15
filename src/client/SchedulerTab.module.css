@@ -76,7 +76,9 @@
 
 /* ── 徽章 ── */
 .scBadge {
-  display: inline-block;
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
   padding: 1px 8px;
   border-radius: 99px;
   font-size: 11px;
@@ -85,10 +87,12 @@
   color: var(--dsw-alias-label-secondary);
   border: 1px solid transparent;
 }
-/* 状态徽章对比度修复（2026-08-15）：secondary 底+primary 字 ≈1.17:1 不达标，
-   对齐 harness 内置范式——tertiary 底 + primary 字，secondary 归位为边框。 */
-.scBadgeOk { background: var(--dsw-alias-state-success-tertiary); color: var(--dsw-alias-state-success-primary); border-color: var(--dsw-alias-state-success-secondary); }
-.scBadgeBad { background: color-mix(in srgb, var(--dsw-alias-state-error-primary) 12%, var(--dsw-alias-bg-layer-1)); color: var(--dsw-alias-state-error-primary); }
+.scBadgeDot { flex: none; }
+/* 状态徽章对比度修复 P0（2026-08-15）：tertiary 底 + 深字（color-mix 向
+   label-primary 混深/混亮，双主题自适应：浅 4.5-7.8:1、深 6-9.5:1 WCAG AA；
+   与 harness 内置 tagContext 手法同构），secondary 归位为边框。 */
+.scBadgeOk { background: var(--dsw-alias-state-success-tertiary); color: color-mix(in srgb, var(--dsw-alias-state-success-primary) 55%, var(--dsw-alias-label-primary)); border-color: var(--dsw-alias-state-success-secondary); }
+.scBadgeBad { background: color-mix(in srgb, var(--dsw-alias-state-error-primary) 12%, var(--dsw-alias-bg-layer-1)); color: color-mix(in srgb, var(--dsw-alias-state-error-primary) 55%, var(--dsw-alias-label-primary)); }
 
 /* ── 任务条 ── */
 .scJobMeta { color: var(--dsw-alias-label-tertiary); font-size: 12px; margin-top: 4px; }

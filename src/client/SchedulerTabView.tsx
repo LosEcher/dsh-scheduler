@@ -24,6 +24,7 @@ import { Button, IconTrashOutline16, Modal } from '@deepseek-ai/dsh-client-ui-pr
 import type {} from '@deepseek-ai/dsh-client-ui-conversation/client'
 import type {} from './locales.ts'
 import css from './SchedulerTab.module.css'
+import { StatusBadge } from './StatusBadge.tsx'
 
 // ---- types (mirror the host API) ----
 
@@ -365,9 +366,9 @@ export function SchedulerTabView({ t }: SchedulerTabViewProps) {
             <div className={css.scRow}>
               <strong>{job.name}</strong>
               {job.state === 'paused'
-                ? <span className={css.scBadgeBad}>{job.pausedReason === 'max_consecutive_failures' ? t('pausedBreaker') : t('paused')}</span>
-                : job.enabled && job.state === 'scheduled' ? <span className={css.scBadgeOk}>{t('enabledBadge')}</span> : <span className={css.scBadgeBad}>{t('completedBadge')}</span>}
-              {running ? <span className={css.scBadge}>{t('running')}</span> : null}
+                ? <StatusBadge state="bad">{job.pausedReason === 'max_consecutive_failures' ? t('pausedBreaker') : t('paused')}</StatusBadge>
+                : job.enabled && job.state === 'scheduled' ? <StatusBadge state="ok">{t('enabledBadge')}</StatusBadge> : <StatusBadge state="bad">{t('completedBadge')}</StatusBadge>}
+              {running ? <StatusBadge state="neutral">{t('running')}</StatusBadge> : null}
               <span className={css.scSpacer} />
               <Button variant="outline" size="sm" disabled={running} onClick={() => setConfirming({ kind: 'trigger', job })}>{t('triggerNow')}</Button>
               {job.state === 'paused'
@@ -388,10 +389,10 @@ export function SchedulerTabView({ t }: SchedulerTabViewProps) {
               <span className={css.scMuted}>{t('nextRun', { time: fmt(job.nextRunAt) })}</span>
               <span className={css.scMuted}>{t('lastRun', { time: fmt(job.lastRunAt) })}</span>
               {job.lastStatus
-                ? <span className={job.lastStatus === 'succeeded' ? css.scBadgeOk : css.scBadgeBad}>{job.lastStatus}</span>
+                ? <StatusBadge state={job.lastStatus === 'succeeded' ? 'ok' : 'bad'}>{job.lastStatus}</StatusBadge>
                 : null}
               <span className={css.scMuted}>{t('runCount', { count: job.runCount })}</span>
-              {job.consecutiveFailures > 0 ? <span className={css.scBadgeBad}>{t('consecutiveFailures', { count: job.consecutiveFailures })}</span> : null}
+              {job.consecutiveFailures > 0 ? <StatusBadge state="bad">{t('consecutiveFailures', { count: job.consecutiveFailures })}</StatusBadge> : null}
               <span className={css.scSpacer} />
               <Button variant="ghost" size="sm"
                 onClick={() => void (runsFor === job.id ? (setRuns([]), setRunsFor(null)) : loadRuns(job.id))}>
@@ -406,15 +407,15 @@ export function SchedulerTabView({ t }: SchedulerTabViewProps) {
                   <details key={r.id} className={css.scRunItem}>
                     <summary className={css.scRunSummary}>
                       <span className={css.scRow}>
-                        <span className={r.status === 'succeeded' ? css.scBadgeOk : r.status === 'failed' ? css.scBadgeBad : css.scBadge}>{r.status}</span>
+                        <StatusBadge state={r.status === 'succeeded' ? 'ok' : r.status === 'failed' ? 'bad' : 'neutral'}>{r.status}</StatusBadge>
                         <span className={css.scMuted}>{r.triggerKind === 'manual' ? t('runManual') : t('runScheduled')}</span>
                         <span className={css.scMuted}>{t('triggeredAt', { time: fmt(r.scheduledFor) })}</span>
                         {r.durationMs !== undefined ? <span className={css.scMuted}>{t('duration', { s: (r.durationMs / 1000).toFixed(1) })}</span> : null}
                         {r.exitCode !== undefined ? <span className={css.scMuted}>{t('exitCode', { code: r.exitCode })}</span> : null}
                         {r.delivery
-                          ? <span className={r.delivery.status === 'delivered' ? css.scBadgeOk : r.delivery.status === 'error' ? css.scBadgeBad : css.scBadge}>
+                          ? <StatusBadge state={r.delivery.status === 'delivered' ? 'ok' : r.delivery.status === 'error' ? 'bad' : 'neutral'}>
                               {r.delivery.status === 'delivered' ? t('deliveredTo', { id: r.delivery.sessionId ?? '' }) : t('deliveryStatus', { status: r.delivery.status })}
-                            </span>
+                            </StatusBadge>
                           : null}
                         <span className={css.scSpacer} />
                         <span className={css.scMuted}>{fmt(r.completedAt ?? r.startedAt)}</span>
