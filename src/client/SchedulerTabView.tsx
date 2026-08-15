@@ -6,40 +6,24 @@
  *   - job list with trigger / next-run / last status / actions
  *   - create+edit form with live trigger preview
  *   - per-job run ledger (status, duration, exit code, output tail)
+ *
+ * Follows the standard DSH plugin client style (see
+ * dsh-plugin-operations「标准插件卡片写法」):
+ *   - All styles through a CSS module with --dsw-alias-* design tokens
+ *     (theme-aware; no inline styles, no hardcoded colors).
+ *   - All copy through the injected `t` seat (locale namespace `scheduler`;
+ *     zh/en dictionaries in locales.ts).
+ *   - ui-primitives atoms (Button, Modal); destructive actions (delete,
+ *     pause/resume, manual trigger) go through a Modal — never
+ *     window.confirm.
  */
 
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
-import type { ConvViewProps } from '@deepseek-ai/dsh-client-ui-conversation/client'
-
-// ---- styles (inline, CSS-var driven like the rest of the shell) ----
-
-const CARD = {
-  background: 'var(--dsw-alias-bg-layer-1)',
-  border: '1px solid var(--dsw-alias-border-l2)',
-  borderRadius: 10,
-  padding: '12px 16px',
-  marginBottom: 12,
-}
-const ROW = { display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap' }
-const BTN = {
-  padding: '4px 10px', borderRadius: 6, cursor: 'pointer', fontSize: 12,
-  border: '1px solid var(--dsw-alias-border-l2)', background: 'var(--dsw-alias-bg-layer-2)',
-  color: 'var(--dsw-alias-label-primary)',
-}
-const BTN_PRIMARY = { ...BTN, background: 'var(--dsw-alias-brand-primary)', color: 'var(--dsw-alias-label-primary-foreground)', borderColor: 'transparent' }
-const INPUT = {
-  width: '100%', boxSizing: 'border-box', padding: '6px 8px', borderRadius: 6, fontSize: 13,
-  border: '1px solid var(--dsw-alias-border-l2)', background: 'var(--dsw-alias-bg-layer-2)',
-  color: 'var(--dsw-alias-label-primary)', fontFamily: 'inherit',
-}
-const BADGE = {
-  padding: '2px 8px', borderRadius: 999, fontSize: 11, border: '1px solid var(--dsw-alias-border-l2)',
-  background: 'var(--dsw-alias-bg-layer-2)',
-}
-const BADGE_OK = { ...BADGE, color: 'var(--dsw-alias-state-success-primary)', borderColor: 'color-mix(in srgb, var(--dsw-alias-state-success-primary) 33%, transparent)' }
-const BADGE_BAD = { ...BADGE, color: 'var(--dsw-alias-state-error-primary)', borderColor: 'color-mix(in srgb, var(--dsw-alias-state-error-primary) 33%, transparent)' }
-const MUTED = { color: 'var(--dsw-alias-label-tertiary)', fontSize: 12 }
-const TITLE = { margin: '0 0 8px', fontSize: 14, fontWeight: 600, color: 'var(--dsw-alias-label-primary)' }
+import type { PropsLocale, PropsRuntime } from '@deepseek-ai/dsh-client-ui-slots'
+import { Button, IconTrashOutline16, Modal } from '@deepseek-ai/dsh-client-ui-primitives'
+import type {} from '@deepseek-ai/dsh-client-ui-conversation/client'
+import type {} from './locales.ts'
+import css from './SchedulerTab.module.css'
 
 // ---- types (mirror the host API) ----
 
@@ -92,6 +76,12 @@ interface Status {
   maxLatenessMs: number
 }
 
+/** Destructive action awaiting Modal confirmation. */
+type ConfirmKind = 'delete' | 'pause' | 'resume' | 'trigger'
+
+/** Props delivered by the slot outlet: runtime share + locale seat. */
+export type SchedulerTabViewProps = PropsRuntime<'conversation.view'> & PropsLocale<typeof import('./locales.ts').NS>
+
 // ---- api helpers ----
 
 async function getJson<T>(path: string, signal?: AbortSignal): Promise<T> {
@@ -111,22 +101,9 @@ async function sendJson(method: string, path: string, body?: unknown): Promise<u
   return data
 }
 
-const fmt = (iso: string | null | undefined) => {
-  if (!iso) return '—'
-  try {
-    return new Date(iso).toLocaleString('zh-CN', { hour12: false })
-  } catch {
-    return iso
-  }
-}
-
-const TRIGGER_DESC: Record<TriggerKind, string> = {
-  cron: 'cron', interval: '间隔', once: '一次性',
-}
-
 // ---- view ----
 
-export function SchedulerTabView(_props: ConvViewProps) {
+export function SchedulerTabView({ t }: SchedulerTabViewProps) {
   const [status, setStatus] = useState<Status | null>(null)
   const [jobs, setJobs] = useState<Job[]>([])
   const [runs, setRuns] = useState<Run[]>([])
@@ -138,6 +115,7 @@ export function SchedulerTabView(_props: ConvViewProps) {
   const [preview, setPreview] = useState<string[] | null>(null)
   const [previewError, setPreviewError] = useState<string | null>(null)
   const [busy, setBusy] = useState(false)
+  const [confirming, setConfirming] = useState<{ kind: ConfirmKind; job: Job } | null>(null)
   const previewTimer = useRef<ReturnType<typeof setTimeout> | undefined>(undefined)
 
   const [form, setForm] = useState({
@@ -145,6 +123,21 @@ export function SchedulerTabView(_props: ConvViewProps) {
     timezone: 'local', workspace: '', enabled: true,
     deliverTo: '', catchUpPolicy: '',
   })
+
+  const fmt = useCallback((iso: string | null | undefined): string => {
+    if (!iso) return t('emptyDate')
+    try {
+      return new Date(iso).toLocaleString('zh-CN', { hour12: false })
+    } catch {
+      return iso
+    }
+  }, [t])
+
+  const triggerKindLabel = useCallback((kind: TriggerKind): string => {
+    if (kind === 'cron') return t('triggerKindCron')
+    if (kind === 'interval') return t('triggerKindInterval')
+    return t('triggerKindOnce')
+  }, [t])
 
   const load = useCallback(async () => {
     setLoading(true)
@@ -252,95 +245,111 @@ export function SchedulerTabView(_props: ConvViewProps) {
     }
   }
 
-  const del = async (job: Job) => {
-    if (!confirm(`删除任务「${job.name}」？运行台账将一并删除。`)) return
-    await act('DELETE', `/scheduler/jobs/${job.id}`)
-    if (runsFor === job.id) { setRuns([]); setRunsFor(null) }
+  /** Run the Modal-confirmed destructive action. */
+  const runConfirmed = async () => {
+    if (!confirming) return
+    const { kind, job } = confirming
+    setConfirming(null)
+    if (kind === 'delete') {
+      await act('DELETE', `/scheduler/jobs/${job.id}`)
+      if (runsFor === job.id) { setRuns([]); setRunsFor(null) }
+      return
+    }
+    if (kind === 'pause') { await act('POST', `/scheduler/jobs/${job.id}/pause`); return }
+    if (kind === 'resume') { await act('POST', `/scheduler/jobs/${job.id}/resume`); return }
+    await act('POST', `/scheduler/jobs/${job.id}/trigger`)
+  }
+
+  const confirmMeta = (kind: ConfirmKind) => {
+    switch (kind) {
+      case 'delete': return { title: t('deleteConfirmTitle'), body: t('deleteConfirmBody', { name: confirming?.job.name ?? '' }), label: t('confirmDelete') }
+      case 'pause': return { title: t('pauseConfirmTitle'), body: t('pauseConfirmBody', { name: confirming?.job.name ?? '' }), label: t('confirmPause') }
+      case 'resume': return { title: t('resumeConfirmTitle'), body: t('resumeConfirmBody', { name: confirming?.job.name ?? '' }), label: t('confirmResume') }
+      case 'trigger': return { title: t('triggerConfirmTitle'), body: t('triggerConfirmBody', { name: confirming?.job.name ?? '' }), label: t('confirmTrigger') }
+    }
   }
 
   const inflightIds = useMemo(() => new Set((status?.inflight ?? []).map((i) => i.jobId)), [status])
 
   return (
-    <div style={{ padding: '12px 16px', maxWidth: 900, margin: '0 auto' }}>
+    <div className={css.scRoot}>
       {/* status strip */}
-      <div style={CARD}>
-        <div style={ROW}>
-          <strong style={{ fontSize: 14 }}>定时任务</strong>
-          <span style={MUTED}>tick: {fmt(status?.lastTickAt)}</span>
-          <span style={MUTED}>在飞: {status?.inflight.length ?? 0}/{status?.maxConcurrent ?? '?'}</span>
-          <span style={MUTED}>任务: {status?.enabledCount ?? '?'}/{status?.jobCount ?? '?'} 启用</span>
-          <span style={MUTED}>熔断: {status?.maxConsecutiveFailures ?? '?'} 连败</span>
-          <span style={MUTED}>追赶: {status?.catchUpPolicy ?? '?'}</span>
-          <span style={{ flex: 1 }} />
-          <button style={BTN} type="button" onClick={() => void load()} disabled={loading}>刷新</button>
-          <button style={BTN_PRIMARY} type="button" onClick={openCreate}>+ 新建任务</button>
+      <div className={css.scCard}>
+        <div className={css.scRow}>
+          <strong className={css.scStatusTitle}>{t('tabTitle')}</strong>
+          <span className={css.scMuted}>{t('statusTick', { time: fmt(status?.lastTickAt) })}</span>
+          <span className={css.scMuted}>{t('statusInflight', { inflight: status?.inflight.length ?? 0, max: status?.maxConcurrent ?? '?' })}</span>
+          <span className={css.scMuted}>{t('statusJobs', { enabled: status?.enabledCount ?? '?', total: status?.jobCount ?? '?' })}</span>
+          <span className={css.scMuted}>{t('statusBreaker', { n: status?.maxConsecutiveFailures ?? '?' })}</span>
+          <span className={css.scMuted}>{t('statusCatchUp', { policy: status?.catchUpPolicy ?? '?' })}</span>
+          <span className={css.scSpacer} />
+          <Button variant="outline" size="sm" onClick={() => void load()} disabled={loading}>{t('refresh')}</Button>
+          <Button variant="primary" size="sm" onClick={openCreate}>{t('newJob')}</Button>
         </div>
-        {error ? <div style={{ color: 'var(--dsw-alias-state-error-primary)', fontSize: 12, marginTop: 6 }}>{error}</div> : null}
+        {error !== null && <div className={css.scError}>{error}</div>}
       </div>
 
       {/* create / edit form */}
       {showForm ? (
-        <div style={CARD}>
-          <h3 style={TITLE}>{editing ? `编辑任务：${editing.name}` : '新建任务'}</h3>
-          <form onSubmit={(e) => void submitForm(e)} style={{ display: 'grid', gap: 8 }}>
-            <label style={{ fontSize: 12 }}>名称
-              <input style={INPUT} value={form.name} onChange={(e) => setForm({ ...form, name: e.target.value })} placeholder="如：每日 CI 巡检" required />
+        <div className={css.scCard}>
+          <h3 className={css.scTitle}>{editing ? t('editJobTitle', { name: editing.name }) : t('newJobTitle')}</h3>
+          <form className={css.scForm} onSubmit={(e) => void submitForm(e)}>
+            <label className={css.scFieldLabel}>{t('formName')}
+              <input className={css.scInput} value={form.name} onChange={(e) => setForm({ ...form, name: e.target.value })} placeholder={t('formNamePlaceholder')} required />
             </label>
-            <label style={{ fontSize: 12 }}>任务 prompt（headless 全新会话执行，需自包含）
-              <textarea style={{ ...INPUT, minHeight: 72, resize: 'vertical' }} value={form.prompt}
-                onChange={(e) => setForm({ ...form, prompt: e.target.value })} placeholder="检查 CI 状态并汇总结果" required />
+            <label className={css.scFieldLabel}>{t('formPrompt')}
+              <textarea className={`${css.scInput} ${css.scTextarea}`} value={form.prompt}
+                onChange={(e) => setForm({ ...form, prompt: e.target.value })} placeholder={t('formPromptPlaceholder')} required />
             </label>
-            <div style={{ ...ROW, alignItems: 'flex-end' }}>
-              <label style={{ fontSize: 12, flex: 1 }}>触发类型
-                <select style={INPUT} value={form.kind} onChange={(e) => setForm({ ...form, kind: e.target.value as TriggerKind })}>
-                  <option value="cron">cron（5 段表达式）</option>
-                  <option value="interval">间隔（如 30m / 2h）</option>
-                  <option value="once">一次性（ISO 时间）</option>
+            <div className={`${css.scRow} ${css.scRowEnd}`}>
+              <label className={`${css.scFieldLabel} ${css.scFieldFlex1}`}>{t('formTriggerKind')}
+                <select className={css.scSelect} value={form.kind} onChange={(e) => setForm({ ...form, kind: e.target.value as TriggerKind })}>
+                  <option value="cron">{t('triggerCron')}</option>
+                  <option value="interval">{t('triggerInterval')}</option>
+                  <option value="once">{t('triggerOnce')}</option>
                 </select>
               </label>
-              <label style={{ fontSize: 12, flex: 2 }}>表达式
-                <input style={INPUT} value={form.expression}
+              <label className={`${css.scFieldLabel} ${css.scFieldFlex2}`}>{t('formExpression')}
+                <input className={css.scInput} value={form.expression}
                   onChange={(e) => setForm({ ...form, expression: e.target.value })}
-                  placeholder={form.kind === 'cron' ? '0 9 * * 1-5' : form.kind === 'interval' ? '30m' : '2026-08-16T09:00:00+08:00'} required />
+                  placeholder={t(form.kind === 'cron' ? 'exprPlaceholderCron' : form.kind === 'interval' ? 'exprPlaceholderInterval' : 'exprPlaceholderOnce')} required />
               </label>
-              <label style={{ fontSize: 12, flex: 1 }}>时区
-                <input style={INPUT} value={form.timezone}
-                  onChange={(e) => setForm({ ...form, timezone: e.target.value })} placeholder="local / Asia/Shanghai" />
+              <label className={`${css.scFieldLabel} ${css.scFieldFlex1}`}>{t('formTimezone')}
+                <input className={css.scInput} value={form.timezone}
+                  onChange={(e) => setForm({ ...form, timezone: e.target.value })} placeholder={t('timezonePlaceholder')} />
               </label>
             </div>
-            <label style={{ fontSize: 12 }}>工作区（headless 运行 cwd，留空用默认）
-              <input style={INPUT} value={form.workspace}
-                onChange={(e) => setForm({ ...form, workspace: e.target.value })}
-                placeholder="如 /Users/echerlos/syncthing/project/dsfolder" />
+            <label className={css.scFieldLabel}>{t('formWorkspace')}
+              <input className={css.scInput} value={form.workspace}
+                onChange={(e) => setForm({ ...form, workspace: e.target.value })} placeholder={t('workspacePlaceholder')} />
             </label>
-            <div style={{ ...ROW, alignItems: 'flex-end' }}>
-              <label style={{ fontSize: 12, flex: 2 }}>结果投递会话（deliverTo，留空不投递）
-                <input style={INPUT} value={form.deliverTo}
-                  onChange={(e) => setForm({ ...form, deliverTo: e.target.value })}
-                  placeholder="目标会话 ID；该会话在线时结果 followup 进去" />
+            <div className={`${css.scRow} ${css.scRowEnd}`}>
+              <label className={`${css.scFieldLabel} ${css.scFieldFlex2}`}>{t('formDeliverTo')}
+                <input className={css.scInput} value={form.deliverTo}
+                  onChange={(e) => setForm({ ...form, deliverTo: e.target.value })} placeholder={t('deliverToPlaceholder')} />
               </label>
-              <label style={{ fontSize: 12, flex: 1 }}>追赶策略
-                <select style={INPUT} value={form.catchUpPolicy}
+              <label className={`${css.scFieldLabel} ${css.scFieldFlex1}`}>{t('formCatchUp')}
+                <select className={css.scSelect} value={form.catchUpPolicy}
                   onChange={(e) => setForm({ ...form, catchUpPolicy: e.target.value })}>
-                  <option value="">跟随全局（run_once）</option>
-                  <option value="run_once">run_once（错过补跑一次）</option>
-                  <option value="skip">skip（超时差即跳过）</option>
+                  <option value="">{t('catchUpGlobal')}</option>
+                  <option value="run_once">{t('catchUpRunOnce')}</option>
+                  <option value="skip">{t('catchUpSkip')}</option>
                 </select>
               </label>
             </div>
-            <label style={{ fontSize: 12, ...ROW }}><input type="checkbox" checked={form.enabled}
-              onChange={(e) => setForm({ ...form, enabled: e.target.checked })} /> 启用</label>
-            <div style={{ fontSize: 12 }}>
-              <strong>未来 5 次触发：</strong>
+            <label className={css.scCheckRow}><input type="checkbox" checked={form.enabled}
+              onChange={(e) => setForm({ ...form, enabled: e.target.checked })} /> {t('formEnabled')}</label>
+            <div className={css.scPreview}>
+              <strong className={css.scPreviewLabel}>{t('previewLabel')}</strong>
               {preview ? (
-                <span style={{ ...MUTED, wordBreak: 'break-all' }}>{preview.map(fmt).join(' ｜ ')}</span>
+                <span className={css.scPreviewValue}>{preview.map((iso) => fmt(iso)).join(t('previewSeparator'))}</span>
               ) : previewError ? (
-                <span style={{ color: 'var(--dsw-alias-state-error-primary)' }}>{previewError}</span>
-              ) : (<span style={MUTED}>…</span>)}
+                <span className={css.scPreviewError}>{previewError}</span>
+              ) : (<span className={css.scMuted}>{t('previewPending')}</span>)}
             </div>
-            <div style={ROW}>
-              <button style={BTN_PRIMARY} type="submit" disabled={busy}>{busy ? '保存中…' : '保存'}</button>
-              <button style={BTN} type="button" onClick={() => { setShowForm(false); setEditing(null) }}>取消</button>
+            <div className={css.scRow}>
+              <Button variant="primary" size="sm" type="submit" disabled={busy}>{busy ? t('saving') : t('save')}</Button>
+              <Button variant="ghost" size="sm" onClick={() => { setShowForm(false); setEditing(null) }}>{t('cancel')}</Button>
             </div>
           </form>
         </div>
@@ -348,73 +357,73 @@ export function SchedulerTabView(_props: ConvViewProps) {
 
       {/* job list */}
       {jobs.length === 0 && !loading ? (
-        <div style={CARD}><span style={MUTED}>暂无定时任务，点「+ 新建任务」创建第一个。</span></div>
+        <div className={css.scCard}><span className={css.scMuted}>{t('noJobs')}</span></div>
       ) : jobs.map((job) => {
         const running = inflightIds.has(job.id)
         return (
-          <div key={job.id} style={CARD}>
-            <div style={ROW}>
+          <div key={job.id} className={css.scCard}>
+            <div className={css.scRow}>
               <strong>{job.name}</strong>
               {job.state === 'paused'
-                ? <span style={BADGE_BAD}>{job.pausedReason === 'max_consecutive_failures' ? '已熔断暂停' : '已暂停'}</span>
-                : job.enabled && job.state === 'scheduled' ? <span style={BADGE_OK}>启用</span> : <span style={BADGE_BAD}>已完成</span>}
-              {running ? <span style={BADGE}>运行中…</span> : null}
-              <span style={{ flex: 1 }} />
-              <button style={BTN} type="button" onClick={() => void act('POST', `/scheduler/jobs/${job.id}/trigger`)} disabled={running}>立即触发</button>
+                ? <span className={css.scBadgeBad}>{job.pausedReason === 'max_consecutive_failures' ? t('pausedBreaker') : t('paused')}</span>
+                : job.enabled && job.state === 'scheduled' ? <span className={css.scBadgeOk}>{t('enabledBadge')}</span> : <span className={css.scBadgeBad}>{t('completedBadge')}</span>}
+              {running ? <span className={css.scBadge}>{t('running')}</span> : null}
+              <span className={css.scSpacer} />
+              <Button variant="outline" size="sm" disabled={running} onClick={() => setConfirming({ kind: 'trigger', job })}>{t('triggerNow')}</Button>
               {job.state === 'paused'
-                ? <button style={BTN} type="button" onClick={() => void act('POST', `/scheduler/jobs/${job.id}/resume`)}>恢复</button>
-                : <button style={BTN} type="button" onClick={() => void act('POST', `/scheduler/jobs/${job.id}/pause`)}>暂停</button>}
-              <button style={BTN} type="button" onClick={() => openEdit(job)}>编辑</button>
-              <button style={BTN} type="button" onClick={() => void del(job)}>删除</button>
+                ? <Button variant="outline" size="sm" onClick={() => setConfirming({ kind: 'resume', job })}>{t('resume')}</Button>
+                : <Button variant="outline" size="sm" onClick={() => setConfirming({ kind: 'pause', job })}>{t('pause')}</Button>}
+              <Button variant="ghost" size="sm" onClick={() => openEdit(job)}>{t('edit')}</Button>
+              <Button variant="ghost" size="sm" icon={<IconTrashOutline16 />} className={css.scDangerText} onClick={() => setConfirming({ kind: 'delete', job })}>{t('delete')}</Button>
             </div>
-            <div style={{ ...MUTED, marginTop: 4 }}>
-              {TRIGGER_DESC[job.trigger.kind]} {job.trigger.expression} · {job.trigger.timezone}
-              {job.workspace ? ` · ${job.workspace}` : ''}
-              {job.deliverTo ? ` · 投递→${job.deliverTo.sessionId}` : ''}
-              {job.catchUpPolicy ? ` · 追赶:${job.catchUpPolicy}` : ''}
+            <div className={css.scJobMeta}>
+              {[
+                `${triggerKindLabel(job.trigger.kind)} ${job.trigger.expression} ${job.trigger.timezone}`,
+                job.workspace ? job.workspace : null,
+                job.deliverTo ? t('deliveryTo', { id: job.deliverTo.sessionId }) : null,
+                job.catchUpPolicy ? t('catchUpTag', { policy: job.catchUpPolicy }) : null,
+              ].filter(Boolean).join(t('separator'))}
             </div>
-            <div style={{ ...ROW, marginTop: 4 }}>
-              <span style={MUTED}>下次: <b>{fmt(job.nextRunAt)}</b></span>
-              <span style={MUTED}>上次: {fmt(job.lastRunAt)}</span>
+            <div className={css.scJobActions}>
+              <span className={css.scMuted}>{t('nextRun', { time: fmt(job.nextRunAt) })}</span>
+              <span className={css.scMuted}>{t('lastRun', { time: fmt(job.lastRunAt) })}</span>
               {job.lastStatus
-                ? <span style={job.lastStatus === 'succeeded' ? BADGE_OK : BADGE_BAD}>{job.lastStatus}</span>
+                ? <span className={job.lastStatus === 'succeeded' ? css.scBadgeOk : css.scBadgeBad}>{job.lastStatus}</span>
                 : null}
-              <span style={MUTED}>运行 {job.runCount} 次</span>
-              {job.consecutiveFailures > 0 ? <span style={BADGE_BAD}>连续失败 {job.consecutiveFailures}</span> : null}
-              <span style={{ flex: 1 }} />
-              <button style={{ ...BTN, fontSize: 11 }} type="button"
+              <span className={css.scMuted}>{t('runCount', { count: job.runCount })}</span>
+              {job.consecutiveFailures > 0 ? <span className={css.scBadgeBad}>{t('consecutiveFailures', { count: job.consecutiveFailures })}</span> : null}
+              <span className={css.scSpacer} />
+              <Button variant="ghost" size="sm"
                 onClick={() => void (runsFor === job.id ? (setRuns([]), setRunsFor(null)) : loadRuns(job.id))}>
-                {runsFor === job.id ? '收起历史' : '运行历史'}
-              </button>
+                {runsFor === job.id ? t('collapseHistory') : t('runHistory')}
+              </Button>
             </div>
 
             {/* run ledger for this job */}
             {runsFor === job.id ? (
-              <div style={{ marginTop: 8, borderTop: '1px solid var(--dsw-alias-border-l2)', paddingTop: 8 }}>
-                {runs.length === 0 ? <span style={MUTED}>暂无运行记录</span> : runs.map((r) => (
-                  <details key={r.id} style={{ marginBottom: 6, fontSize: 12 }}>
-                    <summary style={{ cursor: 'pointer' }}>
-                      <span style={ROW}>
-                        <span style={r.status === 'succeeded' ? BADGE_OK : r.status === 'failed' ? BADGE_BAD : BADGE}>{r.status}</span>
-                        <span style={MUTED}>{r.triggerKind === 'manual' ? '手动' : '定时'}</span>
-                        <span style={MUTED}>触发于 {fmt(r.scheduledFor)}</span>
-                        {r.durationMs !== undefined ? <span style={MUTED}>耗时 {(r.durationMs / 1000).toFixed(1)}s</span> : null}
-                        {r.exitCode !== undefined ? <span style={MUTED}>exit {r.exitCode}</span> : null}
+              <div className={css.scLedger}>
+                {runs.length === 0 ? <span className={css.scMuted}>{t('noRuns')}</span> : runs.map((r) => (
+                  <details key={r.id} className={css.scRunItem}>
+                    <summary className={css.scRunSummary}>
+                      <span className={css.scRow}>
+                        <span className={r.status === 'succeeded' ? css.scBadgeOk : r.status === 'failed' ? css.scBadgeBad : css.scBadge}>{r.status}</span>
+                        <span className={css.scMuted}>{r.triggerKind === 'manual' ? t('runManual') : t('runScheduled')}</span>
+                        <span className={css.scMuted}>{t('triggeredAt', { time: fmt(r.scheduledFor) })}</span>
+                        {r.durationMs !== undefined ? <span className={css.scMuted}>{t('duration', { s: (r.durationMs / 1000).toFixed(1) })}</span> : null}
+                        {r.exitCode !== undefined ? <span className={css.scMuted}>{t('exitCode', { code: r.exitCode })}</span> : null}
                         {r.delivery
-                          ? <span style={r.delivery.status === 'delivered' ? BADGE_OK : BADGE_BAD}>
-                              {r.delivery.status === 'delivered' ? `已投递→${r.delivery.sessionId}` : `投递:${r.delivery.status}`}
+                          ? <span className={r.delivery.status === 'delivered' ? css.scBadgeOk : css.scBadgeBad}>
+                              {r.delivery.status === 'delivered' ? t('deliveredTo', { id: r.delivery.sessionId ?? '' }) : t('deliveryStatus', { status: r.delivery.status })}
                             </span>
                           : null}
-                        <span style={{ flex: 1 }} />
-                        <span style={MUTED}>{fmt(r.completedAt ?? r.startedAt)}</span>
+                        <span className={css.scSpacer} />
+                        <span className={css.scMuted}>{fmt(r.completedAt ?? r.startedAt)}</span>
                       </span>
                     </summary>
-                    {r.error ? <pre style={{ ...MUTED, color: 'var(--dsw-alias-state-error-primary)', whiteSpace: 'pre-wrap', margin: '4px 0' }}>{r.error}</pre> : null}
+                    {r.error ? <pre className={css.scRunError}>{r.error}</pre> : null}
                     {r.outputHead ? (
-                      <pre style={{ ...MUTED, whiteSpace: 'pre-wrap', wordBreak: 'break-all', margin: '4px 0', maxHeight: 240, overflow: 'auto' }}>
-                        {r.outputHead}
-                      </pre>
-                    ) : <span style={MUTED}>（无输出）</span>}
+                      <pre className={css.scRunOutput}>{r.outputHead}</pre>
+                    ) : <span className={css.scMuted}>{t('noOutput')}</span>}
                   </details>
                 ))}
               </div>
@@ -422,6 +431,25 @@ export function SchedulerTabView(_props: ConvViewProps) {
           </div>
         )
       })}
+
+      {/* destructive-action confirmation — Modal, never window.confirm */}
+      {confirming !== null && (
+        <Modal
+          open
+          onClose={() => setConfirming(null)}
+          title={confirmMeta(confirming.kind).title}
+          closeLabel={t('cancel')}
+          description={confirmMeta(confirming.kind).body}
+          footer={(
+            <>
+              <Button variant="ghost" size="sm" onClick={() => setConfirming(null)}>{t('cancel')}</Button>
+              <Button variant="primary" size="sm" onClick={() => void runConfirmed()}>
+                {confirmMeta(confirming.kind).label}
+              </Button>
+            </>
+          )}
+        />
+      )}
     </div>
   )
 }

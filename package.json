@@ -1,6 +1,6 @@
 {
   "name": "dsh-scheduler",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "DSH 定时任务插件：cron/interval/once 触发器持久化存储，headless 独立进程执行，运行台账 + 会话内管理页（host 半包 /scheduler API + client 半包 conversation.view tab）。",
   "private": true,
   "type": "module",
@@ -14,14 +14,23 @@
     "build": "node scripts/build.mjs",
     "test": "node --preserve-symlinks --test 'test/*.test.mjs'"
   },
-  "files": ["index.mjs", "cordis.patch.yml", "lib/client.js", "lib/cron-next.mjs", "lib/store.mjs", "README.md"],
+  "files": [
+    "index.mjs",
+    "cordis.patch.yml",
+    "lib/client.js",
+    "lib/cron-next.mjs",
+    "lib/store.mjs",
+    "README.md"
+  ],
   "license": "MIT",
   "dsh": {
     "bundle": {
       "patch": "./cordis.patch.yml"
     },
     "client": {
-      "inject": ["@deepseek-ai/dsh-client-runtime"],
+      "inject": [
+        "@deepseek-ai/dsh-client-runtime"
+      ],
       "platform": "web"
     }
   },
