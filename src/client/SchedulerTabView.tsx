@@ -24,22 +24,22 @@ const ROW = { display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap' }
 const BTN = {
   padding: '4px 10px', borderRadius: 6, cursor: 'pointer', fontSize: 12,
   border: '1px solid var(--dsw-alias-border-l2)', background: 'var(--dsw-alias-bg-layer-2)',
-  color: 'var(--dsw-alias-text-1)',
+  color: 'var(--dsw-alias-label-primary)',
 }
-const BTN_PRIMARY = { ...BTN, background: 'var(--dsw-alias-accent-1, #4a6cf7)', color: '#fff', borderColor: 'transparent' }
+const BTN_PRIMARY = { ...BTN, background: 'var(--dsw-alias-brand-primary)', color: 'var(--dsw-alias-label-primary-foreground)', borderColor: 'transparent' }
 const INPUT = {
   width: '100%', boxSizing: 'border-box', padding: '6px 8px', borderRadius: 6, fontSize: 13,
   border: '1px solid var(--dsw-alias-border-l2)', background: 'var(--dsw-alias-bg-layer-2)',
-  color: 'var(--dsw-alias-text-1)', fontFamily: 'inherit',
+  color: 'var(--dsw-alias-label-primary)', fontFamily: 'inherit',
 }
 const BADGE = {
   padding: '2px 8px', borderRadius: 999, fontSize: 11, border: '1px solid var(--dsw-alias-border-l2)',
   background: 'var(--dsw-alias-bg-layer-2)',
 }
-const BADGE_OK = { ...BADGE, color: '#2e9e5b', borderColor: '#2e9e5b55' }
-const BADGE_BAD = { ...BADGE, color: '#d64545', borderColor: '#d6454555' }
-const MUTED = { color: 'var(--dsw-alias-text-2)', fontSize: 12 }
-const TITLE = { margin: '0 0 8px', fontSize: 14, fontWeight: 600 }
+const BADGE_OK = { ...BADGE, color: 'var(--dsw-alias-state-success-primary)', borderColor: 'color-mix(in srgb, var(--dsw-alias-state-success-primary) 33%, transparent)' }
+const BADGE_BAD = { ...BADGE, color: 'var(--dsw-alias-state-error-primary)', borderColor: 'color-mix(in srgb, var(--dsw-alias-state-error-primary) 33%, transparent)' }
+const MUTED = { color: 'var(--dsw-alias-label-tertiary)', fontSize: 12 }
+const TITLE = { margin: '0 0 8px', fontSize: 14, fontWeight: 600, color: 'var(--dsw-alias-label-primary)' }
 
 // ---- types (mirror the host API) ----
 
@@ -275,7 +275,7 @@ export function SchedulerTabView(_props: ConvViewProps) {
           <button style={BTN} type="button" onClick={() => void load()} disabled={loading}>刷新</button>
           <button style={BTN_PRIMARY} type="button" onClick={openCreate}>+ 新建任务</button>
         </div>
-        {error ? <div style={{ color: '#d64545', fontSize: 12, marginTop: 6 }}>{error}</div> : null}
+        {error ? <div style={{ color: 'var(--dsw-alias-state-error-primary)', fontSize: 12, marginTop: 6 }}>{error}</div> : null}
       </div>
 
       {/* create / edit form */}
@@ -335,7 +335,7 @@ export function SchedulerTabView(_props: ConvViewProps) {
               {preview ? (
                 <span style={{ ...MUTED, wordBreak: 'break-all' }}>{preview.map(fmt).join(' ｜ ')}</span>
               ) : previewError ? (
-                <span style={{ color: '#d64545' }}>{previewError}</span>
+                <span style={{ color: 'var(--dsw-alias-state-error-primary)' }}>{previewError}</span>
               ) : (<span style={MUTED}>…</span>)}
             </div>
             <div style={ROW}>
@@ -409,7 +409,7 @@ export function SchedulerTabView(_props: ConvViewProps) {
                         <span style={MUTED}>{fmt(r.completedAt ?? r.startedAt)}</span>
                       </span>
                     </summary>
-                    {r.error ? <pre style={{ ...MUTED, color: '#d64545', whiteSpace: 'pre-wrap', margin: '4px 0' }}>{r.error}</pre> : null}
+                    {r.error ? <pre style={{ ...MUTED, color: 'var(--dsw-alias-state-error-primary)', whiteSpace: 'pre-wrap', margin: '4px 0' }}>{r.error}</pre> : null}
                     {r.outputHead ? (
                       <pre style={{ ...MUTED, whiteSpace: 'pre-wrap', wordBreak: 'break-all', margin: '4px 0', maxHeight: 240, overflow: 'auto' }}>
                         {r.outputHead}
