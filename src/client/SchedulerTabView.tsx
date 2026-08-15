@@ -412,7 +412,7 @@ export function SchedulerTabView({ t }: SchedulerTabViewProps) {
                         {r.durationMs !== undefined ? <span className={css.scMuted}>{t('duration', { s: (r.durationMs / 1000).toFixed(1) })}</span> : null}
                         {r.exitCode !== undefined ? <span className={css.scMuted}>{t('exitCode', { code: r.exitCode })}</span> : null}
                         {r.delivery
-                          ? <span className={r.delivery.status === 'delivered' ? css.scBadgeOk : css.scBadgeBad}>
+                          ? <span className={r.delivery.status === 'delivered' ? css.scBadgeOk : r.delivery.status === 'error' ? css.scBadgeBad : css.scBadge}>
                               {r.delivery.status === 'delivered' ? t('deliveredTo', { id: r.delivery.sessionId ?? '' }) : t('deliveryStatus', { status: r.delivery.status })}
                             </span>
                           : null}

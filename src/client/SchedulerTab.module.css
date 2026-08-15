@@ -83,9 +83,12 @@
   font-weight: 500;
   background: var(--dsw-alias-interactive-bg-hover);
   color: var(--dsw-alias-label-secondary);
+  border: 1px solid transparent;
 }
-.scBadgeOk { background: var(--dsw-alias-state-success-secondary); color: var(--dsw-alias-state-success-primary); }
-.scBadgeBad { background: var(--dsw-alias-state-error-secondary); color: var(--dsw-alias-state-error-primary); }
+/* 状态徽章对比度修复（2026-08-15）：secondary 底+primary 字 ≈1.17:1 不达标，
+   对齐 harness 内置范式——tertiary 底 + primary 字，secondary 归位为边框。 */
+.scBadgeOk { background: var(--dsw-alias-state-success-tertiary); color: var(--dsw-alias-state-success-primary); border-color: var(--dsw-alias-state-success-secondary); }
+.scBadgeBad { background: color-mix(in srgb, var(--dsw-alias-state-error-primary) 12%, var(--dsw-alias-bg-layer-1)); color: var(--dsw-alias-state-error-primary); }
 
 /* ── 任务条 ── */
 .scJobMeta { color: var(--dsw-alias-label-tertiary); font-size: 12px; margin-top: 4px; }
