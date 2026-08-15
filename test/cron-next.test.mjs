@@ -107,6 +107,29 @@ test('timezone: America/New_York (EDT, UTC-4) 09:00 = 13:00Z', () => {
   assert.equal(out[0], '2026-08-15T13:00:00.000Z')
 })
 
+test('timezone: Asia/Shanghai dow-restricted cron fires on local Monday (weekday uses job tz, not UTC)', () => {
+  // 2026-08-17 is a Monday in Asia/Shanghai; in UTC the same instant is
+  // Sunday 2026-08-16T16:00Z. The old code computed the weekday from the UTC
+  // instant and skipped the whole local Monday, returning null forever.
+  const after = Date.UTC(2026, 7, 15, 0, 0, 0) // Sat 2026-08-15
+  const out = cronOccurrences('0 9 * * 1', 'Asia/Shanghai', after, 1)
+  assert.equal(out.length, 1)
+  assert.equal(out[0], '2026-08-17T01:00:00.000Z') // local Mon 2026-08-17 09:00
+})
+
+test('timezone: Asia/Shanghai dow-restricted nextCronAfter non-null', () => {
+  const c = parseCron('0 9 * * 1')
+  const next = nextCronAfter(c, Date.now(), 'Asia/Shanghai')
+  assert.ok(next !== null, 'must find a next Monday 09:00 in Asia/Shanghai')
+  assert.equal(new Date(next).getUTCDay(), 1)
+  assert.equal(new Date(next).getUTCHours(), 1) // 09:00 +08
+})
+
+test('timezone: UTC dow-restricted still correct (regression)', () => {
+  const out = cronOccurrences('0 9 * * 1', 'UTC', Date.UTC(2026, 7, 15, 0, 0, 0), 1)
+  assert.equal(out[0], '2026-08-17T09:00:00.000Z')
+})
+
 test('zonedToUtc roundtrip', () => {
   const utc = zonedToUtc('Asia/Shanghai', 2026, 8, 15, 9, 0)
   assert.equal(utc, Date.UTC(2026, 7, 15, 1, 0, 0))
