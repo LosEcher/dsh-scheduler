@@ -53,7 +53,7 @@ export const Config = Schema.object({
 }).description('dsh-scheduler: DSH 定时任务（cron/interval/once + headless 执行 + 台账）')
 
 /** Resolve runtime config: explicit values win, env falls back, then defaults. */
-function resolveConfig(config) {
+export function resolveConfig(config) {
   const dshHome = process.env.DSH_HOME ?? `${homedir()}/.dsh`
   return {
     dataDir: config.dataDir ?? `${dshHome}/storages/dsh-scheduler`,
