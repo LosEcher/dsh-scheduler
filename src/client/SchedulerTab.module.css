@@ -49,22 +49,42 @@
 .scFieldFlex1 { flex: 1; }
 .scFieldFlex2 { flex: 2; }
 
+/* ── 表单控件（2026-08-15 升级，对齐 primitives Input 设计语言 + shadcn NativeSelect）──
+   统一 32px 高、8px 圆角、focus 品牌色环；select 去原生外观 + chevron SVG
+   （fill currentColor 随主题）；placeholder 用 label-dimmed。 */
 .scInput, .scSelect, .scTextarea {
   width: 100%;
   box-sizing: border-box;
-  padding: 6px 8px;
-  border-radius: 6px;
+  padding: 0 8px;
+  border-radius: 8px;
   font-size: 13px;
+  height: 32px;
   border: 1px solid var(--dsw-alias-border-l2);
   background: var(--dsw-alias-bg-layer-2);
   color: var(--dsw-alias-label-primary);
   font-family: inherit;
+  transition: border-color .15s;
 }
+.scTextarea { height: auto; padding: 6px 8px; }
 .scInput:focus, .scSelect:focus, .scTextarea:focus {
   outline: none;
   border-color: var(--dsw-alias-brand-primary);
+  box-shadow: 0 0 0 2px color-mix(in srgb, var(--dsw-alias-brand-primary) 18%, transparent);
 }
+.scInput::placeholder, .scTextarea::placeholder { color: var(--dsw-alias-label-dimmed); }
+.scSelect {
+  appearance: none;
+  -webkit-appearance: none;
+  padding-right: 28px;
+  cursor: pointer;
+  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='10' height='6' viewBox='0 0 10 6'%3E%3Cpath d='M1 1l4 4 4-4' fill='none' stroke='currentColor' stroke-width='1.5' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E");
+  background-repeat: no-repeat;
+  background-position: right 10px center;
+  background-color: var(--dsw-alias-bg-layer-2);
+}
+.scSelect option { color: var(--dsw-alias-label-primary); background: var(--dsw-alias-bg-layer-1); }
 .scTextarea { min-height: 72px; resize: vertical; }
+.scCheckbox { accent-color: var(--dsw-alias-brand-primary); }
 
 .scCheckRow { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; font-size: 12px; }
 

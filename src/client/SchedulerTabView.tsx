@@ -361,7 +361,7 @@ export function SchedulerTabView({ t }: SchedulerTabViewProps) {
                 </select>
               </label>
             </div>
-            <label className={css.scCheckRow}><input type="checkbox" checked={form.enabled}
+            <label className={css.scCheckRow}><input type="checkbox" className={css.scCheckbox} checked={form.enabled}
               onChange={(e) => setForm({ ...form, enabled: e.target.checked })} /> {t('formEnabled')}</label>
             <div className={css.scPreview}>
               <strong className={css.scPreviewLabel}>{t('previewLabel')}</strong>
