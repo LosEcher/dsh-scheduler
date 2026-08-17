@@ -55,6 +55,10 @@ export const Config = Schema.object({
   tickMs: Schema.number().min(5_000).default(60_000),
   /** Auto-pause a job after this many consecutive failures (circuit breaker). */
   maxConsecutiveFailures: Schema.number().min(1).max(100).default(5),
+  /** Total run attempts per logical trigger (1 = no retry). Jobs may override. */
+  maxAttempts: Schema.number().min(1).max(10).default(3),
+  /** Delay before a retry attempt after a transient failure (jobs may override). */
+  retryDelayMs: Schema.number().min(5_000).max(30 * 60_000).default(60_000),
   /** Global catch-up policy ('run_once' fires a missed occurrence once; 'skip' drops it). */
   catchUpPolicy: Schema.string(),
   /** Max lateness for 'skip' catch-up; 0 = unlimited (never skip). */
@@ -75,6 +79,8 @@ export function resolveConfig(config) {
     maxConcurrent: config.maxConcurrent ?? 2,
     tickMs: config.tickMs ?? 60_000,
     maxConsecutiveFailures: config.maxConsecutiveFailures ?? 5,
+    maxAttempts: config.maxAttempts ?? 3,
+    retryDelayMs: config.retryDelayMs ?? 60_000,
     catchUpPolicy: config.catchUpPolicy === 'skip' ? 'skip' : 'run_once',
     maxLatenessMs: config.maxLatenessMs ?? 15 * 60_000,
   }
@@ -163,6 +169,49 @@ export function previewTrigger(kind, expression, timezone, count = 5) {
 // ---- pure decision functions (unit-testable) ---------------------------------
 
 /**
+ * Failure output patterns that indicate a *persistent* condition — retrying
+ * cannot help and would just burn quota/attempts (billing/quota/credentials).
+ * Transient failures (network TRANSPORT errors, 5xx, timeouts, arbitrary
+ * non-zero exits) are retryable. `rate limit` (429) is intentionally NOT
+ * listed: it usually clears within the retry delay.
+ */
+const NON_RETRYABLE_PATTERNS = [
+  /\b402\b/i,
+  /\bpayment\s+required\b/i,
+  /\binsufficient\b/i,
+  // quota/credit in a failure output is almost always a billing/quota context
+  // ("quota has been exhausted", "insufficient credits", "credits depleted").
+  /\b(quota|credits?)\b/i,
+  /\bbalance\s+(low|not\s+enough|insufficient|exhausted|zero)\b/i,
+  /\b401\b/i,
+  /\bunauthorized\b/i,
+  /\binvalid\s+(api\s*)?key\b/i,
+  /\bauthentication\s+(failed|error)\b/i,
+  /\b403\b/i,
+  /\bforbidden\b/i,
+  /\bbilling\s+(error|issue|problem)\b/i,
+  /\baccount\s+(disabled|suspended|banned)\b/i,
+]
+
+/** Transient failures are retryable; persistent ones (quota/auth/billing) are not. */
+export function isRetryableFailure(output) {
+  if (!output) return true
+  return !NON_RETRYABLE_PATTERNS.some((re) => re.test(output))
+}
+
+/**
+ * Decide whether a failed run should be retried. Success never retries;
+ * attempts are capped at maxAttempts (job-level override wins); persistent
+ * failures (quota/auth/billing) are never retried.
+ */
+export function shouldRetry(job, cfg, status, output, attempt) {
+  if (status === 'succeeded') return false
+  const max = job.maxAttempts ?? cfg.maxAttempts
+  if (attempt >= max) return false
+  return isRetryableFailure(output)
+}
+
+/**
  * Decide whether a due job should fire or be skipped by the catch-up policy.
  * `run_once` (default) fires a missed occurrence once, however late; `skip`
  * drops it when lateness exceeds `maxLatenessMs` (0 = unlimited).
@@ -241,10 +290,28 @@ export function normalizeJob(input, existing) {
   if (input.catchUpPolicy !== undefined) {
     catchUpPolicy = input.catchUpPolicy === 'skip' || input.catchUpPolicy === 'run_once' ? input.catchUpPolicy : undefined
   }
+  // maxAttempts / retryDelayMs: per-job overrides of the global retry policy.
+  // null clears the override (back to global), undefined keeps existing.
+  let maxAttempts = existing?.maxAttempts
+  if (input.maxAttempts !== undefined && input.maxAttempts !== null) {
+    const v = Number(input.maxAttempts)
+    maxAttempts = Number.isInteger(v) ? Math.min(Math.max(v, 1), 10) : undefined
+  } else if (input.maxAttempts === null) {
+    maxAttempts = undefined
+  }
+  let retryDelayMs = existing?.retryDelayMs
+  if (input.retryDelayMs !== undefined && input.retryDelayMs !== null) {
+    const v = Number(input.retryDelayMs)
+    retryDelayMs = Number.isFinite(v) ? Math.min(Math.max(Math.round(v), 5_000), 30 * 60_000) : undefined
+  } else if (input.retryDelayMs === null) {
+    retryDelayMs = undefined
+  }
   return {
     name, prompt, trigger, workspace, enabled,
     ...(deliverTo ? { deliverTo } : {}),
     ...(catchUpPolicy ? { catchUpPolicy } : {}),
+    ...(maxAttempts !== undefined ? { maxAttempts } : {}),
+    ...(retryDelayMs !== undefined ? { retryDelayMs } : {}),
   }
 }
 
@@ -297,10 +364,10 @@ export function apply(ctx, config) {
 
   // ---- executor -------------------------------------------------------------
 
-  function runJob(job, triggerKind, scheduledFor) {
+  function runJob(job, triggerKind, scheduledFor, attempt = 1) {
     if (inflight.has(job.id)) {
       store.appendRun({
-        id: newId('run'), jobId: job.id, triggerKind, scheduledFor,
+        id: newId('run'), jobId: job.id, triggerKind, scheduledFor, attempt,
         status: 'skipped', startedAt: nowIso(), completedAt: nowIso(),
         error: 'already running',
       })
@@ -308,7 +375,7 @@ export function apply(ctx, config) {
     }
     if (inflight.size >= cfg.maxConcurrent) {
       store.appendRun({
-        id: newId('run'), jobId: job.id, triggerKind, scheduledFor,
+        id: newId('run'), jobId: job.id, triggerKind, scheduledFor, attempt,
         status: 'skipped', startedAt: nowIso(), completedAt: nowIso(),
         error: `concurrency limit (${cfg.maxConcurrent}) reached`,
       })
@@ -318,7 +385,7 @@ export function apply(ctx, config) {
     const runId = newId('run')
     const startedAt = nowIso()
     inflight.set(job.id, runId)
-    const run = { id: runId, jobId: job.id, triggerKind, scheduledFor, status: 'running', startedAt }
+    const run = { id: runId, jobId: job.id, triggerKind, scheduledFor, attempt, status: 'running', startedAt }
     store.appendRun(run)
     ctx.logger.info(`[dsh-scheduler] fire job "${job.name}" (${job.id}) run=${runId} trigger=${triggerKind}`)
 
@@ -378,31 +445,68 @@ export function apply(ctx, config) {
       if (!inflight.has(job.id) || inflight.get(job.id) !== runId) return
       inflight.delete(job.id)
       const completedAt = nowIso()
+      const durationMs = Date.now() - startedMs
+      const maxAttempts = job.maxAttempts ?? cfg.maxAttempts
+      const retryDelay = job.retryDelayMs ?? cfg.retryDelayMs
+      const failed = result.status !== 'succeeded'
+      const willRetry = failed && shouldRetry(job, cfg, result.status, output, attempt)
       const finalRun = {
         ...run,
         ...result,
-        durationMs: Date.now() - startedMs,
+        durationMs,
         outputHead: output,
         completedAt,
       }
-      const delivery = deliver(job, finalRun)
-      if (delivery) finalRun.delivery = delivery
+      if (willRetry) {
+        finalRun.error = (finalRun.error ? `${finalRun.error}; ` : '')
+          + `[attempt ${attempt}/${maxAttempts}] retrying in ${Math.round(retryDelay / 1000)}s`
+      } else if (failed && attempt > 1) {
+        finalRun.error = (finalRun.error ? `${finalRun.error}; ` : '')
+          + `[attempt ${attempt}/${maxAttempts}] gave up`
+      }
+      // Defer delivery (target-session notification) until the final outcome.
+      if (!willRetry) {
+        const delivery = deliver(job, finalRun)
+        if (delivery) finalRun.delivery = delivery
+      }
       store.appendRun(finalRun)
       ctx.logger.info(
         `[dsh-scheduler] run ${runId} ${result.status} for job "${job.name}" (${job.id})`
+        + ` attempt=${attempt}/${maxAttempts}`
         + ` in ${((Date.now() - startedMs) / 1000).toFixed(1)}s${delivery ? ` delivery=${delivery.status}` : ''}`,
       )
 
       const live = store.getJob(job.id)
-      if (live) {
-        const updated = applyRunResult(live, result, cfg, completedAt)
-        store.upsertJob(updated)
-        if (updated.state === 'paused' && updated.pausedReason === 'max_consecutive_failures') {
-          ctx.logger.warn(
-            `[dsh-scheduler] job "${job.name}" (${job.id}) auto-paused after `
-            + `${updated.consecutiveFailures} consecutive failures (max ${cfg.maxConsecutiveFailures})`,
-          )
-        }
+      if (!live) {
+        scheduleWake()
+        return
+      }
+      if (willRetry) {
+        // Persisted retry state: the tick loop owns the retry timing, so a web
+        // restart between attempts does not lose the retry and the job cannot
+        // double-fire while waiting (retryState branch runs before the normal
+        // due check; nextRunAt points at the retry instant).
+        const until = new Date(Date.now() + retryDelay).toISOString()
+        store.upsertJob({
+          ...live,
+          retryState: { attempt: attempt + 1, triggerKind, scheduledFor, until },
+          nextRunAt: until,
+          updatedAt: nowIso(),
+        })
+        ctx.logger.warn(
+          `[dsh-scheduler] run ${runId} failed (attempt ${attempt}/${maxAttempts}); `
+          + `retry scheduled in ${Math.round(retryDelay / 1000)}s for job "${job.name}" (${job.id})`,
+        )
+        scheduleWake()
+        return
+      }
+      const updated = applyRunResult(live, result, cfg, completedAt)
+      store.upsertJob(updated)
+      if (updated.state === 'paused' && updated.pausedReason === 'max_consecutive_failures') {
+        ctx.logger.warn(
+          `[dsh-scheduler] job "${job.name}" (${job.id}) auto-paused after `
+          + `${updated.consecutiveFailures} consecutive failures (max ${cfg.maxConsecutiveFailures})`,
+        )
       }
       scheduleWake()
     }
@@ -442,8 +546,24 @@ export function apply(ctx, config) {
       const jobs = store.loadJobs()
       for (const job of jobs) {
         if (job.enabled === false || job.state === 'paused' || job.state === 'completed') continue
-        if (!job.nextRunAt || Date.parse(job.nextRunAt) > now) continue
-        const decision = decideCatchUp(job, cfg, now)
+        const nowMs = Date.now()
+        // Retry branch: a failed attempt left a persisted retryState. While
+        // waiting, the job is skipped entirely (no double-fire). When the
+        // `until` instant arrives, fire the next attempt.
+        if (job.retryState) {
+          if (Date.parse(job.retryState.until) > nowMs) continue
+          const rs = job.retryState
+          const live = store.getJob(job.id)
+          if (live) store.upsertJob({ ...live, retryState: undefined, updatedAt: nowIso() })
+          ctx.logger.info(
+            `[dsh-scheduler] retry attempt ${rs.attempt} for job "${job.name}" (${job.id}) `
+            + `trigger=${rs.triggerKind} scheduledFor=${rs.scheduledFor}`,
+          )
+          runJob({ ...job, retryState: undefined }, rs.triggerKind, rs.scheduledFor, rs.attempt)
+          continue
+        }
+        if (!job.nextRunAt || Date.parse(job.nextRunAt) > nowMs) continue
+        const decision = decideCatchUp(job, cfg, nowMs)
         if (decision.action === 'skip') {
           const next = computeNextRun(job, now)
           store.appendRun({
@@ -490,6 +610,7 @@ export function apply(ctx, config) {
       `[dsh-scheduler] started: dataDir=${cfg.dataDir} cli=${defaultEntry.source} `
       + `maxConcurrent=${cfg.maxConcurrent} timeout=${Math.round(cfg.timeoutMs / 1000)}s `
       + `killGrace=${Math.round(cfg.killGraceMs / 1000)}s breaker=${cfg.maxConsecutiveFailures} `
+      + `retry=${cfg.maxAttempts}x/${Math.round(cfg.retryDelayMs / 1000)}s `
       + `catchUp=${cfg.catchUpPolicy}${cfg.catchUpPolicy === 'skip' ? ` maxLateness=${Math.round(cfg.maxLatenessMs / 1000)}s` : ''}`,
     )
     tick()
@@ -536,6 +657,8 @@ export function apply(ctx, config) {
       killGraceMs: cfg.killGraceMs,
       tickMs: cfg.tickMs,
       maxConsecutiveFailures: cfg.maxConsecutiveFailures,
+      maxAttempts: cfg.maxAttempts,
+      retryDelayMs: cfg.retryDelayMs,
       catchUpPolicy: cfg.catchUpPolicy,
       maxLatenessMs: cfg.maxLatenessMs,
     })
