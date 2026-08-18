@@ -465,8 +465,13 @@ export function apply(ctx, config) {
           + `[attempt ${attempt}/${maxAttempts}] gave up`
       }
       // Defer delivery (target-session notification) until the final outcome.
+      // NOTE: `delivery` must be function-scoped — the success log below
+      // references it, and a block-scoped const here crashed the whole web
+      // host on every successful run (ReferenceError), which combined with
+      // catch-up semantics caused an infinite fire→crash→restart→refire loop.
+      let delivery
       if (!willRetry) {
-        const delivery = deliver(job, finalRun)
+        delivery = deliver(job, finalRun)
         if (delivery) finalRun.delivery = delivery
       }
       store.appendRun(finalRun)
