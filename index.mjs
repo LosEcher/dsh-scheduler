@@ -236,7 +236,14 @@ export function applyRunResult(job, result, cfg, completedAt) {
   const consecutiveFailures = succeeded ? 0 : (job.consecutiveFailures ?? 0) + 1
   const tripped = !succeeded && consecutiveFailures >= cfg.maxConsecutiveFailures
   const paused = job.state === 'paused' || job.enabled === false
-  const next = paused ? (job.nextRunAt ? Date.parse(job.nextRunAt) : null) : computeNextRun(job, Date.now())
+  // Dispatch-time accounting already advanced nextRunAt when the scheduled
+  // run was fired; keep that value so interval jobs measure their period from
+  // dispatch, not completion (and so a crash between dispatch and finish can
+  // never be re-fired by catch-up). Manual/retry paths recompute as before.
+  const advanced = job.nextRunAt && Date.parse(job.nextRunAt) > Date.now()
+  const next = paused
+    ? (job.nextRunAt ? Date.parse(job.nextRunAt) : null)
+    : (advanced ? Date.parse(job.nextRunAt) : computeNextRun(job, Date.now()))
   let state = job.state
   if (tripped) state = 'paused'
   else if (next === null && job.trigger.kind === 'once') state = 'completed'
@@ -389,6 +396,25 @@ export function apply(ctx, config) {
     store.appendRun(run)
     ctx.logger.info(`[dsh-scheduler] fire job "${job.name}" (${job.id}) run=${runId} trigger=${triggerKind}`)
 
+    // Dispatch-time accounting: advance nextRunAt *now*, before the run
+    // settles. If the host crashes after dispatch, the restarted scheduler
+    // sees an already-advanced nextRunAt and catch-up will NOT re-fire this
+    // occurrence — the missing piece behind the 2026-08-18 fire→crash→
+    // restart→refire loop (the crash happened before applyRunResult could
+    // persist the advance). Manual triggers do not consume the schedule.
+    if (triggerKind === 'scheduled') {
+      const live = store.getJob(job.id)
+      if (live) {
+        const next = computeNextRun(live, Date.now())
+        store.upsertJob({
+          ...live,
+          lastRunAt: startedAt,
+          nextRunAt: next ? new Date(next).toISOString() : null,
+          updatedAt: startedAt,
+        })
+      }
+    }
+
     const workspace = job.workspace || cfg.defaultWorkspace
     try { mkdirSync(workspace, { recursive: true }) } catch { /* spawn will fail with a clear error */ }
     const startedMs = Date.now()
@@ -441,9 +467,14 @@ export function apply(ctx, config) {
     })
 
     function finish(result) {
-      settled = true
-      if (!inflight.has(job.id) || inflight.get(job.id) !== runId) return
-      inflight.delete(job.id)
+      // Containment: any bug in finish's bookkeeping (e.g. the 2026-08-18
+      // `delivery` ReferenceError, or a throwing logger) must never take down
+      // the whole web host. State that can be written is written inside the
+      // try; on exception we log, clear inflight, and let the next tick retry.
+      try {
+        settled = true
+        if (!inflight.has(job.id) || inflight.get(job.id) !== runId) return
+        inflight.delete(job.id)
       const completedAt = nowIso()
       const durationMs = Date.now() - startedMs
       const maxAttempts = job.maxAttempts ?? cfg.maxAttempts
@@ -514,6 +545,17 @@ export function apply(ctx, config) {
         )
       }
       scheduleWake()
+      } catch (error) {
+        settled = true
+        if (inflight.has(job.id) && inflight.get(job.id) === runId) inflight.delete(job.id)
+        try {
+          ctx.logger.error(
+            `[dsh-scheduler] finish() crashed for run ${runId} (job "${job.name}" ${job.id}): ${renderThrown(error)}`,
+          )
+        } catch {
+          console.error('[dsh-scheduler] finish() crashed:', error)
+        }
+      }
     }
   }
 
@@ -551,6 +593,10 @@ export function apply(ctx, config) {
       const jobs = store.loadJobs()
       for (const job of jobs) {
         if (job.enabled === false || job.state === 'paused' || job.state === 'completed') continue
+        // Never re-dispatch a job whose run is in flight: without this, a due
+        // job would have a skipped "already running" record appended on every
+        // tick while the run is active (ledger spam; observed 29x on 08-18).
+        if (inflight.has(job.id)) continue
         const nowMs = Date.now()
         // Retry branch: a failed attempt left a persisted retryState. While
         // waiting, the job is skipped entirely (no double-fire). When the
