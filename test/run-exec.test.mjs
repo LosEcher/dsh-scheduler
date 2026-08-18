@@ -110,7 +110,7 @@ test('scheduled run succeeds → ledger succeeded, nextRunAt advanced, no crash'
   const job = makeJob()
   store.upsertJob(job)
 
-  const done = await waitFor(() => store.listRuns(job.id).find((r) => r.status !== 'running'))
+  const done = await waitFor(() => store.listRuns(job.id).find((r) => r.evt === 'finish'))
   assert.equal(done.status, 'succeeded')
   assert.equal(done.exitCode, 0)
 
@@ -135,13 +135,13 @@ test('A2 dispatch-time accounting: nextRunAt advanced while run in flight (crash
 
   // While the run is in flight, nextRunAt must already point at the next
   // occurrence — this is what makes crash-restart catch-up idempotent.
-  await waitFor(() => store.listRuns(job.id).some((r) => r.status === 'running'))
+  await waitFor(() => store.listRuns(job.id).some((r) => r.evt === 'start'))
   const during = store.getJob(job.id)
   assert.ok(Date.parse(during.nextRunAt) > Date.now(), 'advanced at dispatch (before finish)')
 
   // After completion, the advanced value is kept (no double-advance, so an
   // interval job measures its period from dispatch, not completion).
-  await waitFor(() => store.listRuns(job.id).some((r) => r.status === 'succeeded'))
+  await waitFor(() => store.listRuns(job.id).some((r) => r.evt === 'finish'))
   assert.equal(store.getJob(job.id).nextRunAt, during.nextRunAt, 'value kept after finish')
   delete process.env.FAKE_HANG_MS
 })
@@ -157,7 +157,7 @@ test('scheduled run fails → ledger failed with exitCode, retry scheduled (fina
   const job = makeJob({ prompt: 'fail __FAIL__ now' })
   store.upsertJob(job)
 
-  const done = await waitFor(() => store.listRuns(job.id).find((r) => r.status !== 'running'))
+  const done = await waitFor(() => store.listRuns(job.id).find((r) => r.evt === 'finish'))
   assert.equal(done.status, 'failed')
   assert.equal(done.exitCode, 3)
   // Attempt 1 failed transiently → the job carries a persisted retryState and
@@ -181,15 +181,15 @@ test('A3 in-flight job produces no skipped spam and no double dispatch', async (
   const job = makeJob({ prompt: 'hang __HANG__ now' })
   store.upsertJob(job)
 
-  await waitFor(() => store.listRuns(job.id).some((r) => r.status === 'running'))
+  await waitFor(() => store.listRuns(job.id).some((r) => r.evt === 'start'))
   // Several ticks pass while the run is in flight (tickMs=500); none may
   // append a skipped "already running" record or start a second run.
   await new Promise((r) => setTimeout(r, 1_800))
   const runs = store.listRuns(job.id)
-  assert.equal(runs.filter((r) => r.status === 'skipped').length, 0, 'no skipped spam')
-  assert.equal(runs.filter((r) => r.status === 'running').length, 1, 'exactly one run in flight')
+  assert.equal(runs.filter((r) => r.evt === 'skipped').length, 0, 'no skipped spam')
+  assert.equal(runs.filter((r) => r.evt === 'start').length, 1, 'exactly one run in flight')
 
-  await waitFor(() => store.listRuns(job.id).some((r) => r.status === 'succeeded'))
+  await waitFor(() => store.listRuns(job.id).some((r) => r.evt === 'finish'))
   assert.equal(distinctRunIds(store.listRuns(job.id)), 1, 'exactly one run id total')
   delete process.env.FAKE_HANG_MS
 })
@@ -207,7 +207,7 @@ test('A1 finish() crash is contained: host survives, ledger written, no re-fire'
 
   // The success log throws inside finish(); containment must still persist the
   // run record and the already-advanced nextRunAt, and keep the host alive.
-  const done = await waitFor(() => store.listRuns(job.id).find((r) => r.status !== 'running'))
+  const done = await waitFor(() => store.listRuns(job.id).find((r) => r.evt === 'finish'))
   assert.equal(done.status, 'succeeded', 'run record persisted despite logger crash')
   const live = store.getJob(job.id)
   assert.ok(Date.parse(live.nextRunAt) > Date.now(), 'advanced nextRunAt survives (no catch-up re-fire)')
@@ -225,14 +225,14 @@ test('retry: failed transient run schedules attempt 2, then gives up', async (t)
   store.upsertJob(job)
 
   // Attempt 1 fails → retryState persisted, nextRunAt points at the retry.
-  const first = await waitFor(() => store.listRuns(job.id).find((r) => r.status === 'failed'))
+  const first = await waitFor(() => store.listRuns(job.id).find((r) => r.evt === 'finish' && r.status === 'failed'))
   assert.equal(first.attempt, 1)
   const withRetry = await waitFor(() => store.getJob(job.id).retryState)
   assert.equal(withRetry.attempt, 2)
 
   // Attempt 2 fails → gives up (attempt == max), retryState cleared, final
   // status applied to the job.
-  await waitFor(() => store.listRuns(job.id).filter((r) => r.status === 'failed').length >= 2)
+  await waitFor(() => store.listRuns(job.id).filter((r) => r.evt === 'finish' && r.status === 'failed').length >= 2)
   const final = store.getJob(job.id)
   assert.equal(final.retryState, undefined)
   assert.equal(final.lastStatus, 'failed')

@@ -326,8 +326,8 @@ export function normalizeJob(input, existing) {
 
 export function apply(ctx, config) {
   const cfg = resolveConfig(config)
-  const store = new Store(cfg.dataDir)
   const inflight = new Map() // jobId -> runId
+  const store = new Store(cfg.dataDir, { inflightProvider: () => new Set(inflight.values()) })
   let tickTimer
   let wakeTimer
   let lastTickAt = null
@@ -374,7 +374,7 @@ export function apply(ctx, config) {
   function runJob(job, triggerKind, scheduledFor, attempt = 1) {
     if (inflight.has(job.id)) {
       store.appendRun({
-        id: newId('run'), jobId: job.id, triggerKind, scheduledFor, attempt,
+        id: newId('run'), jobId: job.id, triggerKind, scheduledFor, attempt, evt: 'skipped',
         status: 'skipped', startedAt: nowIso(), completedAt: nowIso(),
         error: 'already running',
       })
@@ -382,7 +382,7 @@ export function apply(ctx, config) {
     }
     if (inflight.size >= cfg.maxConcurrent) {
       store.appendRun({
-        id: newId('run'), jobId: job.id, triggerKind, scheduledFor, attempt,
+        id: newId('run'), jobId: job.id, triggerKind, scheduledFor, attempt, evt: 'skipped',
         status: 'skipped', startedAt: nowIso(), completedAt: nowIso(),
         error: `concurrency limit (${cfg.maxConcurrent}) reached`,
       })
@@ -392,7 +392,7 @@ export function apply(ctx, config) {
     const runId = newId('run')
     const startedAt = nowIso()
     inflight.set(job.id, runId)
-    const run = { id: runId, jobId: job.id, triggerKind, scheduledFor, attempt, status: 'running', startedAt }
+    const run = { id: runId, jobId: job.id, triggerKind, scheduledFor, attempt, evt: 'start', status: 'running', startedAt }
     store.appendRun(run)
     ctx.logger.info(`[dsh-scheduler] fire job "${job.name}" (${job.id}) run=${runId} trigger=${triggerKind}`)
 
@@ -484,6 +484,7 @@ export function apply(ctx, config) {
       const finalRun = {
         ...run,
         ...result,
+        evt: 'finish',
         durationMs,
         outputHead: output,
         completedAt,
@@ -618,7 +619,7 @@ export function apply(ctx, config) {
         if (decision.action === 'skip') {
           const next = computeNextRun(job, now)
           store.appendRun({
-            id: newId('run'), jobId: job.id, triggerKind: 'scheduled', scheduledFor: job.nextRunAt,
+            id: newId('run'), jobId: job.id, triggerKind: 'scheduled', scheduledFor: job.nextRunAt, evt: 'skipped',
             status: 'skipped', startedAt: nowIso(), completedAt: nowIso(),
             error: `catch-up skipped (late by ${Math.round(decision.latenessMs / 1000)}s > ${Math.round(cfg.maxLatenessMs / 1000)}s)`,
           })
@@ -810,6 +811,7 @@ export function apply(ctx, config) {
 
   async function routeJobRuns(res, id, url) {
     const limit = Number(url.searchParams.get('limit') ?? 50)
+    // In-flight awareness comes from the store's inflightProvider.
     respond(res, 200, { jobId: id, runs: store.listRuns(id, Math.min(Math.max(limit, 1), 200)) })
   }
 
