@@ -1,0 +1,19 @@
+name: test
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      # Self-contained tests only. Host-import tests (config/policy/retry/run-exec)
+      # resolve peer deps via a local DSH profile symlink and are run with
+      # `npm test` on a machine that has DSH installed.
+      - name: Unit tests (no DSH host)
+        run: node --test --test-force-exit test/cron-next.test.mjs test/store-events.test.mjs

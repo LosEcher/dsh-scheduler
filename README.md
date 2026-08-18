@@ -159,15 +159,21 @@ spawn(process.execPath,
 ## 三、安装
 
 ```bash
-# 1. 注册 bundle（link: 指向本仓库）
+# 1. 注册 bundle
 dsh plugin --profile web add github:LosEcher/dsh-scheduler#main
 # 2. 重启 dsh web（宿主插件代码 HMR 不覆盖，必须重启）
-dsh-web-restart.sh
+~/.dsh/scripts/dsh-web-restart.sh
 # 3. 验证
 curl -s http://127.0.0.1:3080/scheduler/status
 ```
 
-> 客户端半包改动（src/client/*）需要 `pnpm run dev:web` 的 client-hmr 或重启后重新构建 `node scripts/build.mjs`。
+本地开发（改源码时）：
+
+```bash
+dsh plugin --profile web add link:/path/to/dsh-scheduler
+```
+
+> 客户端半包改动（src/client/*）需要 `node scripts/build.mjs` 重建 `lib/client.js` 后刷新页面；宿主改动必须重启 dsh web。
 
 ## 三·五、配置与常见坑（2026-08-15 事故复盘）
 
