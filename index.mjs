@@ -23,11 +23,20 @@
 import Schema from '@deepseek-ai/schemastery'
 import { createUserMessage } from '@deepseek-ai/dsh-llm'
 import { spawn } from 'node:child_process'
-import { existsSync, mkdirSync } from 'node:fs'
+import { existsSync, mkdirSync, readFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { homedir } from 'node:os'
 import { Store, newId, nowIso } from './lib/store.mjs'
 import { parseCron, nextCronAfter, cronOccurrences, parseInterval, CronParseError } from './lib/cron-next.mjs'
+
+/** 插件版本（/plugins/<id>/status 约定用；读 package.json，失败返回 null）。 */
+function pluginVersion() {
+  try {
+    return JSON.parse(readFileSync(new URL('./package.json', import.meta.url), 'utf8')).version ?? null
+  } catch {
+    return null
+  }
+}
 
 export const name = 'dsh-scheduler'
 export const inject = ['webServer', 'agents']
@@ -827,6 +836,27 @@ export function apply(ctx, config) {
       respond(res, 400, { code: 'invalid_trigger', message: renderThrown(error) })
     }
   }
+
+  // /plugins/<id>/status 统一约定（2026-08-23）：内部状态只读折叠（exact 独立路由）
+  ctx.webServer.register({
+    kind: 'exact',
+    path: '/plugins/dsh-scheduler/status',
+    handler: (_req, r) => {
+      const jobs = store.loadJobs()
+      respond(r, 200, {
+        ok: true,
+        plugin: 'dsh-scheduler',
+        version: pluginVersion(),
+        counts: {
+          jobs: jobs.length,
+          enabled: jobs.filter((j) => j.enabled && j.state !== 'paused' && j.state !== 'completed').length,
+          inflight: inflight.size,
+        },
+        lastError: null,
+        detail: { lastTickAt, lockHeld: existsSync(store.lockPath) },
+      })
+    },
+  })
 
   const server = ctx.webServer.register({
     kind: 'prefix',
