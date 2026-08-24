@@ -128,6 +128,8 @@ spawn(process.execPath,
 - 退出码 0 → `succeeded`，非 0 → `failed`；
 - **熔断**：连续失败达到 `maxConsecutiveFailures`（默认 5）→ 自动暂停（`enabled=false, state=paused, pausedReason=max_consecutive_failures`），UI 显示「已熔断暂停」，手动恢复后重新计数；
 - **自动重试（带上限）**：`maxAttempts`（默认 3，job 可覆盖 1-10）= 单次逻辑触发的总尝试次数，`retryDelayMs`（默认 60s，job 可覆盖 5s-30min）= 重试间隔。瞬时失败（网络 TRANSPORT/5xx/超时/任意非零退出）自动重试；**持续性失败不重试**（`isRetryableFailure` 识别 402/insufficient balance/quota/credit/401/403/billing/account suspended 等额度与认证类错误，重试只会浪费配额）。重试状态持久化在 job 的 `retryState`（由 tick 驱动，web 重启不丢、等待期不会重复触发）；每次尝试记一条 run（带 `attempt` 序号），重试中失败不递增熔断计数、不投递，最终结果才走 `applyRunResult` 与投递；耗尽上限仍失败则 run 标注 `gave up`；
+- **调度抖动（dispatch jitter，0.3.0）**：全局 `dispatchJitterMaxMs`（默认 180s，0 禁用）让每个定时任务在 cron 时刻后随机延迟 0-max 毫秒再执行——任务不再精确整点触发、彼此错开、避免与外部整点调度（如采集后端的 :00/:30 定时 run）撞车；单任务可用 `trigger.jitterMaxMs` 覆盖（0 即该任务不抖动）。手动触发与失败重试不走抖动（保持响应性）。
+- **每任务模型链（job.model，0.3.0）**：`model: {provider, model, reasoningEffort?, fallback?: [{provider, model, ...}]}` 让任务用指定模型执行（headless 经临时 settings 副本 + settings-file patch 注入，run 结束即清理）。`fallback` 为有序模型链：attempt 1 用主模型，后续 attempt 用 fallback 最后一项（切过去不再回来）——免费渠道（如 opencode-zen/hy3-free）做主渠道、付费渠道（deepseek-official）做兜底，免费渠道瞬态失败自动落到付费重试。未声明 model 的任务沿用 headless 默认模型。
 - **结果投递**：任务配置 `deliverTo.sessionId` 时，运行结束后把结果摘要（renderDelivery）以 `createUserMessage` + `agent.followup` 注入该会话（须是本 web 实例的 live root agent）；目标不在线则台账记 `delivery.skipped`；
 - `harnessDir` 配置：可选；缺省自动发现 dsh CLI（env `DSH_HARNESS_DIR` → `~/.dsh/source/current` → profile 安装 `~/.dsh/profiles/node_modules/@deepseek-ai/dsh` → 报错提示）；`defaultWorkspace` 兜底为 `homedir()`（env `DSH_SCHEDULER_WORKSPACE` 优先）。
 
@@ -139,7 +141,7 @@ spawn(process.execPath,
 | GET | `/scheduler/jobs` | 任务列表 |
 | POST | `/scheduler/jobs` | 创建任务（校验 + 重算 nextRunAt） |
 | GET | `/scheduler/jobs/:id` | 单个任务 |
-| PATCH | `/scheduler/jobs/:id` | 更新（name/prompt/trigger/workspace/enabled/deliverTo/catchUpPolicy/maxAttempts/retryDelayMs） |
+| PATCH | `/scheduler/jobs/:id` | 更新（name/prompt/trigger/workspace/enabled/deliverTo/catchUpPolicy/maxAttempts/retryDelayMs/model） |
 | DELETE | `/scheduler/jobs/:id` | 删除（含台账） |
 | POST | `/scheduler/jobs/:id/trigger` | 手动触发一次（triggerKind=manual） |
 | POST | `/scheduler/jobs/:id/pause` / `/resume` | 暂停 / 恢复 |
