@@ -1,6 +1,6 @@
 {
   "name": "dsh-scheduler",
-  "version": "0.2.1",
+  "version": "0.3.0",
   "description": "DSH 定时任务插件：cron/interval/once 触发器持久化存储，headless 独立进程执行，运行台账 + 会话内管理页（host 半包 /scheduler API + client 半包 conversation.view tab）。",
   "type": "module",
   "main": "index.mjs",

@@ -81,6 +81,33 @@ test('normalizeJob: model object accepted, invalid rejected, null clears', async
   assert.equal('model' in cleared, false)
 })
 
+test('normalizeJob + selectModelForAttempt: fallback chain accepted and selected per attempt', async () => {
+  const { normalizeJob, selectModelForAttempt } = await import(pluginHref)
+  const base = { name: 'x', prompt: 'p', trigger: { kind: 'cron', expression: '0 9 * * *' } }
+  const job = normalizeJob({
+    ...base,
+    model: {
+      provider: 'opencode-zen', model: 'hy3-free',
+      fallback: [{ provider: 'deepseek-official', model: 'deepseek-v4-flash' }],
+    },
+  })
+  assert.deepEqual(job.model.fallback, [{ provider: 'deepseek-official', model: 'deepseek-v4-flash' }])
+  // attempt 1 → primary (free); attempts ≥2 → fallback (paid), stays there.
+  assert.deepEqual(
+    { provider: selectModelForAttempt(job.model, 1).provider, model: selectModelForAttempt(job.model, 1).model },
+    { provider: 'opencode-zen', model: 'hy3-free' },
+  )
+  assert.deepEqual(selectModelForAttempt(job.model, 2), { provider: 'deepseek-official', model: 'deepseek-v4-flash' })
+  assert.deepEqual(selectModelForAttempt(job.model, 3), { provider: 'deepseek-official', model: 'deepseek-v4-flash' })
+  // No fallback declared → every attempt uses the primary.
+  const plain = normalizeJob({ ...base, model: { provider: 'p', model: 'm' } })
+  assert.deepEqual(selectModelForAttempt(plain.model, 3), { provider: 'p', model: 'm' })
+  assert.equal(selectModelForAttempt(null, 2), null)
+  // Invalid fallback entries are rejected.
+  assert.throws(() => normalizeJob({ ...base, model: { provider: 'p', model: 'm', fallback: 'x' } }), /fallback must be an array/)
+  assert.throws(() => normalizeJob({ ...base, model: { provider: 'p', model: 'm', fallback: [{}] } }), /fallback entries/)
+})
+
 test('normalizeJob: null clears an existing model (not resurrected by spread)', async () => {
   const { normalizeJob } = await import(pluginHref)
   const existing = {

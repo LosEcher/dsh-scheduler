@@ -347,8 +347,11 @@ export function normalizeJob(input, existing) {
   } else if (input.retryDelayMs === null) {
     retryDelayMs = undefined
   }
-  // model: per-job model override {provider, model, reasoningEffort?} run through
-  // the headless profile's default model settings. null clears, undefined keeps.
+  // model: per-job model override {provider, model, reasoningEffort?, fallback?}
+  // run through the headless profile's default model settings. fallback is an
+  // ordered list of models tried on later attempts (attempt 1 uses the primary
+  // model; attempts ≥2 use the last fallback entry, or the primary when none
+  // is declared). null clears, undefined keeps.
   let model = existing?.model
   if (input.model !== undefined) {
     if (input.model === null) {
@@ -360,9 +363,10 @@ export function normalizeJob(input, existing) {
       const reasoningEffort = input.model.reasoningEffort !== undefined
         ? String(input.model.reasoningEffort).trim()
         : undefined
-      model = { provider, model: mdl, ...(reasoningEffort ? { reasoningEffort } : {}) }
+      const fallback = normalizeModelChain(input.model.fallback)
+      model = { provider, model: mdl, ...(reasoningEffort ? { reasoningEffort } : {}), ...(fallback.length ? { fallback } : {}) }
     } else {
-      throw new Error('model must be an object {provider, model, reasoningEffort?}')
+      throw new Error('model must be an object {provider, model, reasoningEffort?, fallback?}')
     }
   }
   return {
@@ -373,6 +377,33 @@ export function normalizeJob(input, existing) {
     ...(retryDelayMs !== undefined ? { retryDelayMs } : {}),
     ...(model ? { model } : {}),
   }
+}
+
+/** Validate a fallback chain: array of {provider, model, reasoningEffort?}. */
+function normalizeModelChain(fallback) {
+  if (fallback === undefined || fallback === null) return []
+  if (!Array.isArray(fallback)) throw new Error('model.fallback must be an array of {provider, model}')
+  const out = []
+  for (const entry of fallback) {
+    if (!entry || typeof entry !== 'object') throw new Error('model.fallback entries must be objects')
+    const provider = String(entry.provider ?? '').trim()
+    const mdl = String(entry.model ?? '').trim()
+    if (provider === '' || mdl === '') throw new Error('model.fallback entries need provider and model')
+    const reasoningEffort = entry.reasoningEffort !== undefined ? String(entry.reasoningEffort).trim() : undefined
+    out.push({ provider, model: mdl, ...(reasoningEffort ? { reasoningEffort } : {}) })
+  }
+  return out
+}
+
+/**
+ * Model for a given attempt: attempt 1 → primary; attempts ≥2 → last fallback
+ * entry when one is declared (stay on the fallback once switched), else primary.
+ */
+export function selectModelForAttempt(model, attempt) {
+  if (!model) return null
+  const chain = [model, ...(model.fallback ?? [])]
+  const idx = attempt <= 1 ? 0 : Math.min(attempt - 1, chain.length - 1)
+  return chain[idx]
 }
 
 // ---- cordis plugin ----------------------------------------------------------
@@ -565,11 +596,16 @@ export function apply(ctx, config) {
     }, cfg.timeoutMs)
 
     // Per-job model override: private settings copy + patch, scoped to this run.
-    const modelOverride = job.model ? prepareModelOverride(job.model, runId) : null
+    // attempt 1 runs the primary model; later attempts fall back along the
+    // declared chain (see selectModelForAttempt), so a free primary channel
+    // that fails transiently retries on the paid fallback instead of failing.
+    const runModel = selectModelForAttempt(job.model, attempt)
+    const modelOverride = runModel ? prepareModelOverride(runModel, runId) : null
     if (modelOverride) {
       ctx.logger.info(
-        `[dsh-scheduler] run ${runId} model override ${job.model.provider}/${job.model.model}`
-        + (job.model.reasoningEffort ? ` (${job.model.reasoningEffort})` : ''),
+        `[dsh-scheduler] run ${runId} model override ${runModel.provider}/${runModel.model}`
+        + (runModel.reasoningEffort ? ` (${runModel.reasoningEffort})` : '')
+        + (attempt > 1 ? ` attempt=${attempt}` : ''),
       )
     }
 
