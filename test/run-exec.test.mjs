@@ -37,6 +37,9 @@ function makeCfg(over = {}) {
     retryDelayMs: 5_000,
     catchUpPolicy: 'run_once',
     maxLatenessMs: 60_000,
+    // Execution-path tests assert deterministic dispatch; jitter would delay
+    // due occurrences by up to dispatchJitterMaxMs and time out waitFor().
+    dispatchJitterMaxMs: 0,
     ...over,
   }
 }
@@ -259,4 +262,31 @@ test('manual trigger does not consume the schedule (nextRunAt untouched)', async
   const run = store.listRuns(job.id)[0]
   assert.equal(run.triggerKind, 'manual')
   assert.equal(store.getJob(job.id).nextRunAt, future, 'schedule not consumed by manual run')
+})
+
+test('dispatch jitter: due job waits trigger.jitterMaxMs before firing', async (t) => {
+  const { ctx } = makeCtx()
+  const mod = await import(pluginHref)
+  const cfg = makeCfg() // dispatchJitterMaxMs: 0 — trigger-level jitter is fixed
+  mod.apply(ctx, cfg)
+  t.after(() => ctx._cleanup())
+  const { Store } = await import('../lib/store.mjs')
+  const store = new Store(cfg.dataDir)
+  const job = makeJob({
+    trigger: { kind: 'interval', expression: '60s', timezone: 'local', everySeconds: 60, jitterMaxMs: 1_200 },
+  })
+  store.upsertJob(job)
+
+  // Inside the jitter window nothing may dispatch.
+  await new Promise((r) => setTimeout(r, 500))
+  assert.equal(
+    store.listRuns(job.id).filter((r) => r.evt === 'start').length,
+    0,
+    'no dispatch before jitter elapses',
+  )
+
+  // After the jitter elapses the run fires (fake harness settles in ms).
+  const done = await waitFor(() => store.listRuns(job.id).find((r) => r.evt === 'finish'), 8_000)
+  assert.equal(done.status, 'succeeded')
+  assert.equal(store.getJob(job.id).consecutiveFailures, 0)
 })

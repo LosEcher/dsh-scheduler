@@ -23,7 +23,7 @@
 import Schema from '@deepseek-ai/schemastery'
 import { createUserMessage } from '@deepseek-ai/dsh-llm'
 import { spawn } from 'node:child_process'
-import { existsSync, mkdirSync, readFileSync } from 'node:fs'
+import { existsSync, mkdirSync, readFileSync, readdirSync, rmSync, unlinkSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { homedir } from 'node:os'
 import { Store, newId, nowIso } from './lib/store.mjs'
@@ -72,6 +72,14 @@ export const Config = Schema.object({
   catchUpPolicy: Schema.string(),
   /** Max lateness for 'skip' catch-up; 0 = unlimited (never skip). */
   maxLatenessMs: Schema.number().min(0).default(15 * 60_000),
+  /**
+   * Global dispatch jitter: a scheduled job fires after a random delay in
+   * [0, dispatchJitterMaxMs] past its cron instant. Spreads headless runs so
+   * jobs do not all fire on the exact minute (and do not collide with
+   * external :00/:30 schedulers). 0 disables; per-job override via
+   * trigger.jitterMaxMs.
+   */
+  dispatchJitterMaxMs: Schema.number().min(0).max(30 * 60_000).default(3 * 60_000),
 }).description('dsh-scheduler: DSH 定时任务（cron/interval/once + headless 执行 + 台账）')
 
 /** Resolve runtime config: explicit values win, env falls back, then defaults. */
@@ -92,6 +100,7 @@ export function resolveConfig(config) {
     retryDelayMs: config.retryDelayMs ?? 60_000,
     catchUpPolicy: config.catchUpPolicy === 'skip' ? 'skip' : 'run_once',
     maxLatenessMs: config.maxLatenessMs ?? 15 * 60_000,
+    dispatchJitterMaxMs: config.dispatchJitterMaxMs ?? 3 * 60_000,
   }
 }
 
@@ -142,7 +151,23 @@ export function normalizeTrigger(trigger) {
     default:
       throw new CronParseError(`trigger.kind must be cron | interval | once, got "${kind}"`)
   }
-  return { kind, expression, timezone, ...(everySeconds !== undefined ? { everySeconds } : {}) }
+  // Dispatch jitter (optional): max random delay before firing this job's
+  // scheduled occurrence. 0 disables. Absent → falls back to the global
+  // dispatchJitterMaxMs at dispatch time.
+  let jitterMaxMs
+  if (trigger.jitterMaxMs !== undefined && trigger.jitterMaxMs !== null) {
+    jitterMaxMs = Number(trigger.jitterMaxMs)
+    if (!Number.isFinite(jitterMaxMs) || jitterMaxMs < 0) {
+      throw new CronParseError(`trigger.jitterMaxMs must be a non-negative number, got "${trigger.jitterMaxMs}"`)
+    }
+  }
+  return {
+    kind,
+    expression,
+    timezone,
+    ...(everySeconds !== undefined ? { everySeconds } : {}),
+    ...(jitterMaxMs !== undefined ? { jitterMaxMs } : {}),
+  }
 }
 
 /** Next fire instant (epoch ms) for a normalized job after `now`, or null. */
@@ -322,12 +347,31 @@ export function normalizeJob(input, existing) {
   } else if (input.retryDelayMs === null) {
     retryDelayMs = undefined
   }
+  // model: per-job model override {provider, model, reasoningEffort?} run through
+  // the headless profile's default model settings. null clears, undefined keeps.
+  let model = existing?.model
+  if (input.model !== undefined) {
+    if (input.model === null) {
+      model = undefined
+    } else if (typeof input.model === 'object') {
+      const provider = String(input.model.provider ?? '').trim()
+      const mdl = String(input.model.model ?? '').trim()
+      if (provider === '' || mdl === '') throw new Error('model.provider and model.model are required')
+      const reasoningEffort = input.model.reasoningEffort !== undefined
+        ? String(input.model.reasoningEffort).trim()
+        : undefined
+      model = { provider, model: mdl, ...(reasoningEffort ? { reasoningEffort } : {}) }
+    } else {
+      throw new Error('model must be an object {provider, model, reasoningEffort?}')
+    }
+  }
   return {
     name, prompt, trigger, workspace, enabled,
     ...(deliverTo ? { deliverTo } : {}),
     ...(catchUpPolicy ? { catchUpPolicy } : {}),
     ...(maxAttempts !== undefined ? { maxAttempts } : {}),
     ...(retryDelayMs !== undefined ? { retryDelayMs } : {}),
+    ...(model ? { model } : {}),
   }
 }
 
@@ -336,6 +380,8 @@ export function normalizeJob(input, existing) {
 export function apply(ctx, config) {
   const cfg = resolveConfig(config)
   const inflight = new Map() // jobId -> runId
+  /** jobId -> fireAt(ms): a due scheduled occurrence waiting out its dispatch jitter. */
+  const jitterPending = new Map()
   const store = new Store(cfg.dataDir, { inflightProvider: () => new Set(inflight.values()) })
   let tickTimer
   let wakeTimer
@@ -379,6 +425,75 @@ export function apply(ctx, config) {
   }
 
   // ---- executor -------------------------------------------------------------
+
+  /**
+   * Per-run model override: copy the user settings.yaml, replace the
+   * agent-default-model section with the job's selection, and write a tiny
+   * cordis patch that points the settings-file row at the copy. Headless
+   * inherits the harness-wide settings doc, so an in-place edit would leak
+   * into concurrent runs and the web host — a private copy keeps the override
+   * scoped to exactly this run. Returns null when the job has no model or the
+   * source cannot be patched safely (the run then uses the default model).
+   */
+  function prepareModelOverride(model, runId) {
+    const home = process.env.DSH_HOME ?? `${homedir()}/.dsh`
+    const src = join(home, 'settings.yaml')
+    if (!existsSync(src)) return null
+    let text
+    try {
+      text = readFileSync(src, 'utf8')
+    } catch {
+      return null
+    }
+    // Replace the fixed-shape top-level section:
+    //   agent-default-model:
+    //     provider: ...
+    //     model: ...
+    //     reasoningEffort: ...   (optional)
+    const pat = /^agent-default-model:\n(?:[ \t]+[^\n]*\n)+/m
+    const block = 'agent-default-model:\n'
+      + `  provider: ${model.provider}\n`
+      + `  model: ${model.model}\n`
+      + (model.reasoningEffort ? `  reasoningEffort: ${model.reasoningEffort}\n` : '')
+    const next = pat.test(text) ? text.replace(pat, block) : null
+    if (next === null) return null
+    const tmpDir = join(cfg.dataDir, 'tmp')
+    mkdirSync(tmpDir, { recursive: true })
+    const settingsPath = join(tmpDir, `settings-${runId}.yaml`)
+    const patchPath = join(tmpDir, `patch-${runId}.yml`)
+    try {
+      writeFileSync(settingsPath, next, { mode: 0o600 })
+      writeFileSync(
+        patchPath,
+        `# dsh-scheduler per-run model override (generated; do not edit)\n`
+        + `- id: settings\n  config:\n    path: '${settingsPath}'\n`,
+        { mode: 0o600 },
+      )
+    } catch {
+      try { unlinkSync(settingsPath) } catch { /* ignore */ }
+      try { unlinkSync(patchPath) } catch { /* ignore */ }
+      return null
+    }
+    return { settingsPath, patchPath }
+  }
+
+  function cleanupModelOverride(ov) {
+    if (!ov) return
+    try { unlinkSync(ov.settingsPath) } catch { /* ignore */ }
+    try { unlinkSync(ov.patchPath) } catch { /* ignore */ }
+  }
+
+  function cleanupStaleOverrides() {
+    try {
+      const tmpDir = join(cfg.dataDir, 'tmp')
+      if (!existsSync(tmpDir)) return
+      for (const f of readdirSync(tmpDir)) {
+        if (f.startsWith('settings-') || f.startsWith('patch-')) {
+          try { unlinkSync(join(tmpDir, f)) } catch { /* ignore */ }
+        }
+      }
+    } catch { /* ignore */ }
+  }
 
   function runJob(job, triggerKind, scheduledFor, attempt = 1) {
     if (inflight.has(job.id)) {
@@ -449,7 +564,20 @@ export function apply(ctx, config) {
       }, cfg.killGraceMs)
     }, cfg.timeoutMs)
 
-    const child = spawn(process.execPath, [...defaultEntry.args, '--profile', 'headless', job.prompt], {
+    // Per-job model override: private settings copy + patch, scoped to this run.
+    const modelOverride = job.model ? prepareModelOverride(job.model, runId) : null
+    if (modelOverride) {
+      ctx.logger.info(
+        `[dsh-scheduler] run ${runId} model override ${job.model.provider}/${job.model.model}`
+        + (job.model.reasoningEffort ? ` (${job.model.reasoningEffort})` : ''),
+      )
+    }
+
+    const child = spawn(process.execPath, [
+      ...defaultEntry.args, '--profile', 'headless',
+      ...(modelOverride ? ['--patch', modelOverride.patchPath] : []),
+      job.prompt,
+    ], {
       cwd: workspace,
       env: process.env,
       stdio: ['ignore', 'pipe', 'pipe'],
@@ -482,6 +610,7 @@ export function apply(ctx, config) {
       // try; on exception we log, clear inflight, and let the next tick retry.
       try {
         settled = true
+        cleanupModelOverride(modelOverride)
         if (!inflight.has(job.id) || inflight.get(job.id) !== runId) return
         inflight.delete(job.id)
       const completedAt = nowIso()
@@ -624,6 +753,27 @@ export function apply(ctx, config) {
           continue
         }
         if (!job.nextRunAt || Date.parse(job.nextRunAt) > nowMs) continue
+        // Dispatch jitter: a due scheduled occurrence first waits out a random
+        // delay in [0, jitterMax] (per-job trigger.jitterMaxMs, else the global
+        // dispatchJitterMaxMs; 0 disables). In-memory only: on host restart the
+        // delay re-rolls, which is fine — jitter is a spread, not a contract.
+        // Retry attempts and manual triggers bypass jitter (they call runJob
+        // directly and never reach here with a fresh nextRunAt).
+        const jitterMax = job.trigger?.jitterMaxMs ?? cfg.dispatchJitterMaxMs
+        if (jitterMax > 0) {
+          const pending = jitterPending.get(job.id)
+          if (pending === undefined) {
+            const fireAt = nowMs + Math.floor(Math.random() * jitterMax)
+            jitterPending.set(job.id, fireAt)
+            ctx.logger.info(
+              `[dsh-scheduler] job "${job.name}" (${job.id}) due at ${job.nextRunAt} `
+              + `waiting jitter +${Math.round((fireAt - nowMs) / 1000)}s`,
+            )
+            continue
+          }
+          if (pending > nowMs) continue
+          jitterPending.delete(job.id)
+        }
         const decision = decideCatchUp(job, cfg, nowMs)
         if (decision.action === 'skip') {
           const next = computeNextRun(job, now)
@@ -661,6 +811,11 @@ export function apply(ctx, config) {
       const t = Date.parse(job.nextRunAt)
       if (earliest === null || t < earliest) earliest = t
     }
+    // A jitter-pending occurrence must wake exactly when its random delay
+    // elapses; otherwise we would busy-poll every 500ms while it waits.
+    for (const fireAt of jitterPending.values()) {
+      if (earliest === null || fireAt < earliest) earliest = fireAt
+    }
     if (earliest === null) return
     const delay = Math.min(Math.max(earliest - now, 500), MAX_TIMER_DELAY_MS)
     wakeTimer = setTimeout(() => tick(), delay)
@@ -672,8 +827,10 @@ export function apply(ctx, config) {
       + `maxConcurrent=${cfg.maxConcurrent} timeout=${Math.round(cfg.timeoutMs / 1000)}s `
       + `killGrace=${Math.round(cfg.killGraceMs / 1000)}s breaker=${cfg.maxConsecutiveFailures} `
       + `retry=${cfg.maxAttempts}x/${Math.round(cfg.retryDelayMs / 1000)}s `
-      + `catchUp=${cfg.catchUpPolicy}${cfg.catchUpPolicy === 'skip' ? ` maxLateness=${Math.round(cfg.maxLatenessMs / 1000)}s` : ''}`,
+      + `catchUp=${cfg.catchUpPolicy}${cfg.catchUpPolicy === 'skip' ? ` maxLateness=${Math.round(cfg.maxLatenessMs / 1000)}s` : ''} `
+      + `jitter=${cfg.dispatchJitterMaxMs > 0 ? `${Math.round(cfg.dispatchJitterMaxMs / 1000)}s` : 'off'}`,
     )
+    cleanupStaleOverrides()
     tick()
     tickTimer = setInterval(() => tick(), cfg.tickMs)
   }

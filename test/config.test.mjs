@@ -48,3 +48,35 @@ test('explicit config wins over env-derived defaults', async () => {
   assert.equal(cfg.harnessDir, '/tmp/h')
   assert.equal(cfg.timeoutMs, 60_000)
 })
+
+test('dispatchJitterMaxMs: default 180s, explicit wins, 0 disables', async () => {
+  const { resolveConfig } = await import(pluginHref)
+  assert.equal(resolveConfig({}).dispatchJitterMaxMs, 180_000)
+  assert.equal(resolveConfig({ dispatchJitterMaxMs: 0 }).dispatchJitterMaxMs, 0)
+  assert.equal(resolveConfig({ dispatchJitterMaxMs: 45_000 }).dispatchJitterMaxMs, 45_000)
+})
+
+test('normalizeTrigger: jitterMaxMs accepted, invalid rejected, absent omitted', async () => {
+  const { normalizeTrigger } = await import(pluginHref)
+  const withJitter = normalizeTrigger({ kind: 'cron', expression: '0 9 * * *', timezone: 'Asia/Shanghai', jitterMaxMs: 120_000 })
+  assert.equal(withJitter.jitterMaxMs, 120_000)
+  const zero = normalizeTrigger({ kind: 'interval', expression: '1h', jitterMaxMs: 0 })
+  assert.equal(zero.jitterMaxMs, 0)
+  const absent = normalizeTrigger({ kind: 'cron', expression: '0 9 * * *' })
+  assert.equal('jitterMaxMs' in absent, false)
+  assert.throws(() => normalizeTrigger({ kind: 'cron', expression: '0 9 * * *', jitterMaxMs: -5 }), /jitterMaxMs/)
+  assert.throws(() => normalizeTrigger({ kind: 'cron', expression: '0 9 * * *', jitterMaxMs: 'x' }), /jitterMaxMs/)
+})
+
+test('normalizeJob: model object accepted, invalid rejected, null clears', async () => {
+  const { normalizeJob } = await import(pluginHref)
+  const base = { name: 'x', prompt: 'p', trigger: { kind: 'cron', expression: '0 9 * * *' } }
+  const withModel = normalizeJob({ ...base, model: { provider: 'opencode-zen', model: 'deepseek-v4-flash-free', reasoningEffort: 'high' } })
+  assert.deepEqual(withModel.model, { provider: 'opencode-zen', model: 'deepseek-v4-flash-free', reasoningEffort: 'high' })
+  const minimal = normalizeJob({ ...base, model: { provider: 'p', model: 'm' } })
+  assert.deepEqual(minimal.model, { provider: 'p', model: 'm' })
+  assert.throws(() => normalizeJob({ ...base, model: { provider: '' } }), /model/)
+  assert.throws(() => normalizeJob({ ...base, model: 'deepseek' }), /model must be an object/)
+  const cleared = normalizeJob({ ...base, model: null })
+  assert.equal('model' in cleared, false)
+})
