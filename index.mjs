@@ -933,6 +933,10 @@ export function apply(ctx, config) {
       nextRunAt: next ? new Date(next).toISOString() : null,
       updatedAt: nowIso(),
     }
+    // Explicit-clears: normalizeJob omits keys it cleared, but {...existing}
+    // would then resurrect them — delete instead so null truly removes.
+    if (input.model === null) delete job.model
+    if (input.deliverTo === null) delete job.deliverTo
     store.upsertJob(job)
     scheduleWake()
     respond(res, 200, { job })

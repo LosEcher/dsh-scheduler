@@ -80,3 +80,18 @@ test('normalizeJob: model object accepted, invalid rejected, null clears', async
   const cleared = normalizeJob({ ...base, model: null })
   assert.equal('model' in cleared, false)
 })
+
+test('normalizeJob: null clears an existing model (not resurrected by spread)', async () => {
+  const { normalizeJob } = await import(pluginHref)
+  const existing = {
+    name: 'x', prompt: 'p',
+    trigger: { kind: 'cron', expression: '0 9 * * *' },
+    model: { provider: 'nvidia-nim', model: 'nvidia/llama-3.3-nemotron-super-49b-v1.5' },
+  }
+  const cleared = normalizeJob({ model: null }, existing)
+  assert.equal('model' in cleared, false, 'normalizeJob omits a cleared model')
+  // Simulate routeUpdateJob's {...existing, ...fields} merge: without the
+  // explicit delete, the cleared value would be resurrected from existing.
+  const merged = { ...existing, ...cleared }
+  assert.equal('model' in merged, true, 'spread resurrects existing.model (route must delete)')
+})
