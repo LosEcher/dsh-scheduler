@@ -25,6 +25,27 @@ test('isRetryableFailure: transient transport/network errors are retryable', asy
   assert.equal(isRetryableFailure('rate limit exceeded, retry later'), true, '429 rate limit stays retryable')
 })
 
+test('isRetryableFailure: model-unavailable errors are retryable even when framed as 401/400', async () => {
+  const { isRetryableFailure } = await import(pluginHref)
+  // 2026-08-31 hermes: opencode-zen framed "model not supported" as AUTH 401 —
+  // must stay retryable so the job's fallback chain (deepseek) gets attempt 2.
+  assert.equal(isRetryableFailure('dsh: AUTH: 401: {"type":"ModelError","message":"Model hy3-free is not supported"}'), true)
+  assert.equal(isRetryableFailure('INVALID_REQUEST: 400: {"type":"server_error","message":"Error from provider (Console): Upstream request failed: Model is unavailable."}'), true)
+  assert.equal(isRetryableFailure('Model not found: gpt-99'), true)
+  // plain 401s that are NOT model-availability still stay non-retryable
+  assert.equal(isRetryableFailure('Error 401: invalid api key'), false)
+  assert.equal(isRetryableFailure('authentication failed: unauthorized'), false)
+})
+
+test('shouldRetry: model-unavailable failure retries and reaches the fallback attempt', async () => {
+  const { shouldRetry } = await import(pluginHref)
+  const job = { id: 'j1' }
+  const out = 'dsh: AUTH: 401: {"type":"ModelError","message":"Model hy3-free is not supported"}'
+  assert.equal(shouldRetry(job, cfg(), 'failed', out, 1), true, 'attempt 1 model-unavailable -> retry with fallback model')
+  assert.equal(shouldRetry(job, cfg(), 'failed', out, 2), true, 'attempt 2 still within max 3')
+  assert.equal(shouldRetry(job, cfg(), 'failed', out, 3), false, 'attempt 3 == max 3 -> no retry')
+})
+
 test('isRetryableFailure: quota/billing/auth failures are NOT retryable', async () => {
   const { isRetryableFailure } = await import(pluginHref)
   assert.equal(isRetryableFailure('HTTP 402 Payment Required: insufficient balance'), false)

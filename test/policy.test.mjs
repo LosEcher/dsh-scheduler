@@ -56,9 +56,10 @@ test('decideCatchUp: job-level policy overrides global', async () => {
 test('applyRunResult: success resets failures and advances the schedule', async () => {
   const { applyRunResult } = await import(pluginHref)
   const completedAt = new Date().toISOString()
-  const before = intervalJob({ consecutiveFailures: 3, runCount: 7 })
+  const before = intervalJob({ consecutiveFailures: 3, runCount: 7, alertedFailures: 3 })
   const after = applyRunResult(before, { status: 'succeeded' }, cfg(), completedAt)
   assert.equal(after.consecutiveFailures, 0)
+  assert.equal(after.alertedFailures, 0, 'success resets the failure-alert watermark')
   assert.equal(after.runCount, 8)
   assert.equal(after.lastStatus, 'succeeded')
   assert.equal(after.state, 'scheduled')
@@ -100,6 +101,21 @@ test('applyRunResult: paused job keeps its schedule untouched', async () => {
   assert.equal(after.state, 'paused')
   assert.equal(after.enabled, false)
   assert.equal(after.nextRunAt, '2026-12-31T00:00:00.000Z')
+})
+
+test('applyRunResult: failure keeps the alert watermark until caller bumps it', async () => {
+  const { applyRunResult } = await import(pluginHref)
+  let job = intervalJob({ alertedFailures: 1 })
+  job = applyRunResult(job, { status: 'failed', exitCode: 1 }, cfg(), new Date().toISOString())
+  assert.equal(job.consecutiveFailures, 1)
+  assert.equal(job.alertedFailures, 1, 'failure does not bump the watermark by itself')
+})
+
+test('resolveConfig: alertOnConsecutiveFailures defaults to 2, 0 disables', async () => {
+  const { resolveConfig } = await import(pluginHref)
+  assert.equal(resolveConfig({}).alertOnConsecutiveFailures, 2)
+  assert.equal(resolveConfig({ alertOnConsecutiveFailures: 0 }).alertOnConsecutiveFailures, 0)
+  assert.equal(resolveConfig({ alertOnConsecutiveFailures: 4 }).alertOnConsecutiveFailures, 4)
 })
 
 test('renderDelivery: includes status, trigger, duration and output head', async () => {

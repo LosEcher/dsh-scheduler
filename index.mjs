@@ -64,6 +64,13 @@ export const Config = Schema.object({
   tickMs: Schema.number().min(5_000).default(60_000),
   /** Auto-pause a job after this many consecutive failures (circuit breaker). */
   maxConsecutiveFailures: Schema.number().min(1).max(100).default(5),
+  /**
+   * Push a Feishu alert (via ~/.dsh/scripts/feishu-push.sh) once a job's
+   * consecutive failures reach this threshold (0 disables). Fires once per
+   * failure streak: the job's alertedFailures field records the level already
+   * alerted, and a successful run resets it, so the next streak alerts again.
+   */
+  alertOnConsecutiveFailures: Schema.number().min(0).max(100).default(2),
   /** Total run attempts per logical trigger (1 = no retry). Jobs may override. */
   maxAttempts: Schema.number().min(1).max(10).default(3),
   /** Delay before a retry attempt after a transient failure (jobs may override). */
@@ -96,6 +103,7 @@ export function resolveConfig(config) {
     maxConcurrent: config.maxConcurrent ?? 2,
     tickMs: config.tickMs ?? 60_000,
     maxConsecutiveFailures: config.maxConsecutiveFailures ?? 5,
+    alertOnConsecutiveFailures: config.alertOnConsecutiveFailures ?? 2,
     maxAttempts: config.maxAttempts ?? 3,
     retryDelayMs: config.retryDelayMs ?? 60_000,
     catchUpPolicy: config.catchUpPolicy === 'skip' ? 'skip' : 'run_once',
@@ -227,9 +235,24 @@ const NON_RETRYABLE_PATTERNS = [
   /\baccount\s+(disabled|suspended|banned)\b/i,
 ]
 
+/**
+ * Model-availability failures: upstreams (e.g. opencode-zen) often frame
+ * "model not supported / unavailable" as 401/400, which NON_RETRYABLE_PATTERNS
+ * would otherwise swallow. These are transient in practice — the model may come
+ * back, and the run's fallback chain exists precisely to absorb them — so they
+ * must stay retryable for the fallback model to ever run (2026-08-31 hermes
+ * job: `AUTH: 401 ... "Model hy3-free is not supported"` never reached the
+ * deepseek fallback).
+ */
+const MODEL_UNAVAILABLE_PATTERNS = [
+  /\bmodel\b[^\n]*(?:not\s+supported|unavailable|not\s+found|not\s+available)/i,
+  /\bmodel\s+is\s+unavailable\b/i,
+]
+
 /** Transient failures are retryable; persistent ones (quota/auth/billing) are not. */
 export function isRetryableFailure(output) {
   if (!output) return true
+  if (MODEL_UNAVAILABLE_PATTERNS.some((re) => re.test(output))) return true
   return !NON_RETRYABLE_PATTERNS.some((re) => re.test(output))
 }
 
@@ -270,6 +293,10 @@ export function applyRunResult(job, result, cfg, completedAt) {
   const consecutiveFailures = succeeded ? 0 : (job.consecutiveFailures ?? 0) + 1
   const tripped = !succeeded && consecutiveFailures >= cfg.maxConsecutiveFailures
   const paused = job.state === 'paused' || job.enabled === false
+  // Failure-alert watermark: success resets it so the next failure streak can
+  // alert again; a failed run keeps the previous watermark (the caller bumps
+  // it to the current level after pushing, via upsert, so one streak = one alert).
+  const alertedFailures = succeeded ? 0 : (job.alertedFailures ?? 0)
   // Dispatch-time accounting already advanced nextRunAt when the scheduled
   // run was fired; keep that value so interval jobs measure their period from
   // dispatch, not completion (and so a crash between dispatch and finish can
@@ -287,6 +314,7 @@ export function applyRunResult(job, result, cfg, completedAt) {
     lastStatus: result.status,
     runCount: (job.runCount ?? 0) + 1,
     consecutiveFailures,
+    alertedFailures,
     nextRunAt: next ? new Date(next).toISOString() : null,
     state,
     enabled: tripped ? false : job.enabled,
@@ -719,6 +747,17 @@ export function apply(ctx, config) {
           + `${updated.consecutiveFailures} consecutive failures (max ${cfg.maxConsecutiveFailures})`,
         )
       }
+      // Failure alert: final failure (no retry) crossing the threshold, once
+      // per failure streak (alertedFailures watermark). Fire-and-forget push
+      // through ~/.dsh/scripts/feishu-push.sh; never blocks or throws (any
+      // exception here must not take down the web host — scheduler 2026-08-18
+      // crash-loop precedent).
+      if (!willRetry && result.status !== 'succeeded' && cfg.alertOnConsecutiveFailures > 0
+          && updated.consecutiveFailures >= cfg.alertOnConsecutiveFailures
+          && (live.alertedFailures ?? 0) < updated.consecutiveFailures) {
+        store.upsertJob({ ...updated, alertedFailures: updated.consecutiveFailures })
+        pushFailureAlert(job, updated, finalRun, attempt, maxAttempts)
+      }
       scheduleWake()
       } catch (error) {
         settled = true
@@ -754,6 +793,45 @@ export function apply(ctx, config) {
     } catch (error) {
       ctx.logger.warn(`[dsh-scheduler] delivery failed: ${renderThrown(error)}`)
       return { status: 'error', reason: renderThrown(error) }
+    }
+  }
+
+  /**
+   * Push a failure alert to Feishu via the push script. Fire-and-forget:
+   * spawns bash, never awaits, never throws. The script path is configurable
+   * through env DSH_SCHEDULER_ALERT_SCRIPT for test/override.
+   */
+  function pushFailureAlert(job, updated, run, attempt, maxAttempts) {
+    const script = process.env.DSH_SCHEDULER_ALERT_SCRIPT
+      ?? `${homedir()}/.dsh/scripts/feishu-push.sh`
+    if (!existsSync(script)) {
+      ctx.logger.warn(`[dsh-scheduler] failure alert skipped: ${script} not found`)
+      return
+    }
+    const head = String(run.outputHead ?? '').slice(0, 300).replace(/\n/g, ' ').replace(/\s+/g, ' ')
+    const text = [
+      `【dsh-scheduler 告警】定时任务「${job.name}」连续失败 ${updated.consecutiveFailures} 次`,
+      `- job: ${job.id}`,
+      `- 状态: ${run.status}（attempt ${attempt}/${maxAttempts}）`,
+      run.error ? `- 错误: ${String(run.error).slice(0, 200)}` : null,
+      head ? `- 输出: ${head}` : null,
+    ].filter(Boolean).join('\n')
+    try {
+      const child = spawn('bash', [script, text], { stdio: ['ignore', 'ignore', 'pipe'] })
+      child.stderr.on('data', (d) => {
+        ctx.logger.warn(`[dsh-scheduler] failure alert stderr: ${String(d).slice(0, 200)}`)
+      })
+      child.on('error', (error) => {
+        ctx.logger.warn(`[dsh-scheduler] failure alert push failed: ${renderThrown(error)}`)
+      })
+      child.on('close', (code) => {
+        ctx.logger.info(
+          `[dsh-scheduler] failure alert pushed for "${job.name}" (${job.id}) `
+          + `consecutive=${updated.consecutiveFailures} exit=${code}`,
+        )
+      })
+    } catch (error) {
+      ctx.logger.warn(`[dsh-scheduler] failure alert push error: ${renderThrown(error)}`)
     }
   }
 
