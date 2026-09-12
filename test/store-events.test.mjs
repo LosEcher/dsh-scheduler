@@ -139,3 +139,45 @@ test('legacy rows without evt fold as-is (backward compatible)', (t) => {
   assert.equal(runs[0].status, 'succeeded')
   assert.equal(runs[0].id, 'run-legacy')
 })
+
+// ── ledger rotation (2026-09-12 audit) ──────────────────────────────────────
+// The earlier trim dropped the oldest lines outright: a 1.5 MB ledger rotated at
+// the 2 MB cap would have kept ~41 days and lost everything older. Rotation now
+// archives the dropped lines into archive/runs-<YYYY-MM>.jsonl.
+
+test('rotation keeps the newest maxRuns lines and archives the rest by month', (t) => {
+  const dir = mkdtempSync(join(tmpdir(), 'dsh-scheduler-rotate-'))
+  t.after(() => rmSync(dir, { recursive: true, force: true }))
+  const store = new Store(dir, { maxRuns: 4 })
+  const jobId = 'job-1'
+  const months = ['2026-07', '2026-07', '2026-08', '2026-08', '2026-09', '2026-09']
+  for (const [i, month] of months.entries()) {
+    store.appendRun({
+      id: `run-${i}`, jobId, evt: 'finish', status: 'succeeded',
+      startedAt: `${month}-01T00:00:00.000Z`, completedAt: `${month}-01T00:01:00.000Z`,
+    })
+  }
+  const result = store.rotateRuns()
+  assert.equal(result.kept, 4)
+  assert.equal(result.archived, 2)
+  const live = store.listRuns(jobId, 50)
+  assert.equal(live.length, 4, 'only the newest maxRuns runs stay inline')
+  assert.equal(live[0].id, 'run-5', 'newest first')
+  // Nothing is lost: the two oldest rows land in their month's archive file.
+  const july = store.readArchive('2026-07')
+  assert.equal(july.length, 2)
+  assert.match(july[0], /run-0/)
+  assert.equal(store.readArchive('2026-09').length, 0)
+})
+
+test('rotation is a no-op below maxRuns', (t) => {
+  const dir = mkdtempSync(join(tmpdir(), 'dsh-scheduler-rotate-noop-'))
+  t.after(() => rmSync(dir, { recursive: true, force: true }))
+  const store = new Store(dir, { maxRuns: 10 })
+  const jobId = 'job-1'
+  for (let i = 0; i < 3; i++) {
+    store.appendRun({ id: `run-${i}`, jobId, evt: 'finish', status: 'succeeded', startedAt: nowIso(), completedAt: nowIso() })
+  }
+  assert.deepEqual(store.rotateRuns(), { archived: 0, kept: 3 })
+  assert.equal(store.listRuns(jobId, 50).length, 3)
+})

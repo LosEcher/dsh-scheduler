@@ -77,6 +77,14 @@ export const Config = Schema.object({
   retryDelayMs: Schema.number().min(5_000).max(30 * 60_000).default(60_000),
   /** Global catch-up policy ('run_once' fires a missed occurrence once; 'skip' drops it). */
   catchUpPolicy: Schema.string(),
+  /**
+   * Max ledger lines kept inline in runs.jsonl. Older lines are archived into
+   * archive/runs-<YYYY-MM>.jsonl (never dropped). 2026-09-12 audit: the earlier
+   * hard-coded 500 discarded ~90% of history whenever rotation ran.
+   */
+  maxRuns: Schema.number().min(100).default(5000),
+  /** Per-run timeout for a job's assertCmd (its own mechanical acceptance test). */
+  assertTimeoutMs: Schema.number().min(1_000).max(10 * 60_000).default(60_000),
   /** Max lateness for 'skip' catch-up; 0 = unlimited (never skip). */
   maxLatenessMs: Schema.number().min(0).default(15 * 60_000),
   /**
@@ -109,11 +117,32 @@ export function resolveConfig(config) {
     catchUpPolicy: config.catchUpPolicy === 'skip' ? 'skip' : 'run_once',
     maxLatenessMs: config.maxLatenessMs ?? 15 * 60_000,
     dispatchJitterMaxMs: config.dispatchJitterMaxMs ?? 3 * 60_000,
+    maxRuns: config.maxRuns ?? 5000,
+    assertTimeoutMs: config.assertTimeoutMs ?? 60_000,
   }
 }
 
 const MAX_TIMER_DELAY_MS = 2_147_483_647
 const OUTPUT_TAIL_BYTES = 8192
+
+const PREFLIGHT_ERROR_PATTERNS = [
+  /ERR_MODULE_NOT_FOUND/i,
+  /cannot find package/i,
+  /cannot locate the dsh CLI/i,
+]
+
+/** Validate local execution prerequisites before spending an attempt. */
+export function preflightExecution(entry, workspace) {
+  if (!entry || !Array.isArray(entry.args) || entry.args.length === 0) {
+    return 'preflight: dsh CLI entry is missing'
+  }
+  if (!workspace || !String(workspace).trim()) return 'preflight: workspace is empty'
+  const source = String(entry.source ?? '')
+  if (PREFLIGHT_ERROR_PATTERNS.some((pattern) => pattern.test(source))) {
+    return `preflight: invalid CLI entry (${source})`
+  }
+  return null
+}
 
 function tail(text, max = OUTPUT_TAIL_BYTES) {
   const buf = Buffer.from(text)
@@ -315,6 +344,9 @@ export function applyRunResult(job, result, cfg, completedAt) {
     runCount: (job.runCount ?? 0) + 1,
     consecutiveFailures,
     alertedFailures,
+    // Surfaced by /scheduler/status: how late the last dispatch actually was
+    // (host asleep/blocked makes a cron job fire tens of minutes late).
+    lastDispatchLatencyMs: result.dispatchLatencyMs ?? job.lastDispatchLatencyMs ?? null,
     nextRunAt: next ? new Date(next).toISOString() : null,
     state,
     enabled: tripped ? false : job.enabled,
@@ -397,6 +429,13 @@ export function normalizeJob(input, existing) {
       throw new Error('model must be an object {provider, model, reasoningEffort?, fallback?}')
     }
   }
+  // assertCmd: optional mechanical acceptance test. Runs via /bin/bash -lc in
+  // the job workspace after a clean exit; non-zero marks the run failed
+  // ("green but empty" guard). Null clears, undefined keeps.
+  let assertCmd = existing?.assertCmd
+  if (input.assertCmd !== undefined) {
+    assertCmd = input.assertCmd === null ? undefined : (String(input.assertCmd).trim().slice(0, 4000) || undefined)
+  }
   return {
     name, prompt, trigger, workspace, enabled,
     ...(deliverTo ? { deliverTo } : {}),
@@ -404,6 +443,7 @@ export function normalizeJob(input, existing) {
     ...(maxAttempts !== undefined ? { maxAttempts } : {}),
     ...(retryDelayMs !== undefined ? { retryDelayMs } : {}),
     ...(model ? { model } : {}),
+    ...(assertCmd ? { assertCmd } : {}),
   }
 }
 
@@ -441,7 +481,10 @@ export function apply(ctx, config) {
   const inflight = new Map() // jobId -> runId
   /** jobId -> fireAt(ms): a due scheduled occurrence waiting out its dispatch jitter. */
   const jitterPending = new Map()
-  const store = new Store(cfg.dataDir, { inflightProvider: () => new Set(inflight.values()) })
+  const store = new Store(cfg.dataDir, {
+    inflightProvider: () => new Set(inflight.values()),
+    maxRuns: cfg.maxRuns,
+  })
   let tickTimer
   let wakeTimer
   let lastTickAt = null
@@ -572,11 +615,39 @@ export function apply(ctx, config) {
       return
     }
 
+    const workspace = job.workspace || cfg.defaultWorkspace
+    const preflightError = preflightExecution(defaultEntry, workspace)
+    if (preflightError) {
+      const timestamp = nowIso()
+      store.appendRun({
+        id: newId('run'), jobId: job.id, triggerKind, scheduledFor, attempt,
+        evt: 'finish', status: 'failed', startedAt: timestamp, completedAt: timestamp,
+        error: preflightError, retryable: false,
+      })
+      ctx.logger.error(`[dsh-scheduler] ${preflightError} for job "${job.name}" (${job.id}); retry skipped`)
+      return
+    }
+
     const runId = newId('run')
     const startedAt = nowIso()
     inflight.set(job.id, runId)
-    const run = { id: runId, jobId: job.id, triggerKind, scheduledFor, attempt, evt: 'start', status: 'running', startedAt }
+    // Dispatch latency: how late the run actually started against its scheduled
+    // instant. Recorded so host-asleep drift (macOS Clamshell Sleep defers Node
+    // timers to the next dark wake — measured 18-35 min on 9 mornings, 2026-09-12
+    // audit) is visible in the ledger instead of hidden behind a green status.
+    const scheduledMs = Date.parse(scheduledFor)
+    const dispatchLatencyMs = Number.isFinite(scheduledMs) ? Math.max(0, Date.now() - scheduledMs) : undefined
+    const run = {
+      id: runId, jobId: job.id, triggerKind, scheduledFor, attempt, evt: 'start', status: 'running', startedAt,
+      ...(dispatchLatencyMs !== undefined && attempt === 1 ? { dispatchLatencyMs } : {}),
+    }
     store.appendRun(run)
+    if (dispatchLatencyMs !== undefined && attempt === 1 && dispatchLatencyMs > 5 * 60_000) {
+      ctx.logger.warn(
+        `[dsh-scheduler] run ${runId} dispatched ${(dispatchLatencyMs / 60_000).toFixed(1)}min late `
+        + `for job "${job.name}" (${job.id}); scheduled ${scheduledFor} — host was asleep or blocked`,
+      )
+    }
     ctx.logger.info(`[dsh-scheduler] fire job "${job.name}" (${job.id}) run=${runId} trigger=${triggerKind}`)
 
     // Dispatch-time accounting: advance nextRunAt *now*, before the run
@@ -598,7 +669,6 @@ export function apply(ctx, config) {
       }
     }
 
-    const workspace = job.workspace || cfg.defaultWorkspace
     try { mkdirSync(workspace, { recursive: true }) } catch { /* spawn will fail with a clear error */ }
     const startedMs = Date.now()
     let output = ''
@@ -661,11 +731,83 @@ export function apply(ctx, config) {
       } else if (signal) {
         finish({ status: 'failed', error: `killed by ${signal}` })
       } else if (code === 0) {
-        finish({ status: 'succeeded', exitCode: 0 })
+        // exit 0 only means the headless process finished cleanly — it says
+        // nothing about whether the job actually delivered. An optional
+        // assertCmd is the job's own mechanical acceptance test (2026-09-12
+        // audit: the feed job reported 15 "succeeded" runs with zero output).
+        runAssert().then((assertion) => {
+          if (settled) return
+          if (assertion && !assertion.ok) {
+            ctx.logger.error(
+              `[dsh-scheduler] run ${runId} assert FAILED (exit ${assertion.exitCode}) for job "${job.name}" (${job.id}): `
+              + (assertion.output || '(no output)').slice(0, 300),
+            )
+            finish({
+              status: 'failed',
+              exitCode: 0,
+              assertFailed: true,
+              assertExitCode: assertion.exitCode,
+              error: `assert failed (exit ${assertion.exitCode}): ${assertion.output || '(no output)'}`.slice(0, 500),
+            })
+            return
+          }
+          finish({ status: 'succeeded', exitCode: 0, ...(assertion ? { assertExitCode: 0 } : {}) })
+        }).catch((error) => {
+          if (settled) return
+          finish({ status: 'succeeded', exitCode: 0, assertError: renderThrown(error) })
+        })
       } else {
         finish({ status: 'failed', exitCode: code ?? -1 })
       }
     })
+
+    /**
+     * Run the job's mechanical acceptance test (job.assertCmd) after a clean
+     * exit. Returns null when no assertion is declared, else
+     * { ok, exitCode, output }. Assert failures are treated as NON-retryable
+     * (deterministic condition; a retry would re-run side effects such as an
+     * already-sent notification) but still count toward the failure streak.
+     */
+    function runAssert() {
+      const cmd = String(job.assertCmd ?? '').trim()
+      if (!cmd) return Promise.resolve(null)
+      return new Promise((resolve) => {
+        let out = ''
+        let done = false
+        let child
+        try {
+          child = spawn('/bin/bash', ['-lc', cmd], {
+            cwd: workspace,
+            env: process.env,
+            stdio: ['ignore', 'pipe', 'pipe'],
+          })
+        } catch (error) {
+          resolve({ ok: false, exitCode: -1, output: `assert spawn: ${renderThrown(error)}` })
+          return
+        }
+        const timer = setTimeout(() => {
+          if (done) return
+          done = true
+          try { child.kill('SIGKILL') } catch { /* ignore */ }
+          resolve({ ok: false, exitCode: -1, output: `assert timeout after ${Math.round(cfg.assertTimeoutMs / 1000)}s` })
+        }, cfg.assertTimeoutMs)
+        const push = (d) => { out = tail(out + d.toString('utf8')) }
+        child.stdout.on('data', push)
+        child.stderr.on('data', push)
+        child.on('error', (error) => {
+          if (done) return
+          done = true
+          clearTimeout(timer)
+          resolve({ ok: false, exitCode: -1, output: `assert spawn: ${renderThrown(error)}` })
+        })
+        child.on('close', (code) => {
+          if (done) return
+          done = true
+          clearTimeout(timer)
+          resolve({ ok: code === 0, exitCode: code ?? -1, output: out.trim() })
+        })
+      })
+    }
 
     function finish(result) {
       // Containment: any bug in finish's bookkeeping (e.g. the 2026-08-18
@@ -682,7 +824,10 @@ export function apply(ctx, config) {
       const maxAttempts = job.maxAttempts ?? cfg.maxAttempts
       const retryDelay = job.retryDelayMs ?? cfg.retryDelayMs
       const failed = result.status !== 'succeeded'
-      const willRetry = failed && shouldRetry(job, cfg, result.status, output, attempt)
+      // Assert failures are deterministic: retrying would just re-run the same
+      // side effects (including any notification already sent) without fixing
+      // the condition. They still count toward the failure streak/alert.
+      const willRetry = failed && !result.assertFailed && shouldRetry(job, cfg, result.status, output, attempt)
       const finalRun = {
         ...run,
         ...result,
@@ -993,6 +1138,27 @@ export function apply(ctx, config) {
       retryDelayMs: cfg.retryDelayMs,
       catchUpPolicy: cfg.catchUpPolicy,
       maxLatenessMs: cfg.maxLatenessMs,
+      maxRuns: cfg.maxRuns,
+      assertTimeoutMs: cfg.assertTimeoutMs,
+      dispatchJitterMaxMs: cfg.dispatchJitterMaxMs,
+      // Per-job health: the fields an audit needs without opening the ledger —
+      // how old the last run is, whether it is failing, and how late it
+      // actually fired (macOS sleep drift is invisible otherwise).
+      jobs: jobs.map((j) => ({
+        id: j.id,
+        name: j.name,
+        enabled: j.enabled,
+        state: j.state,
+        trigger: j.trigger.kind === 'cron' ? j.trigger.expression : `${j.trigger.kind}:${j.trigger.expression}`,
+        nextRunAt: j.nextRunAt ?? null,
+        lastRunAt: j.lastRunAt ?? null,
+        lastStatus: j.lastStatus ?? null,
+        lastRunAgeMs: j.lastRunAt ? Date.now() - Date.parse(j.lastRunAt) : null,
+        runCount: j.runCount ?? 0,
+        consecutiveFailures: j.consecutiveFailures ?? 0,
+        lastDispatchLatencyMs: j.lastDispatchLatencyMs ?? null,
+        assertCmd: j.assertCmd ?? null,
+      })),
     })
   }
 
@@ -1051,6 +1217,7 @@ export function apply(ctx, config) {
     // would then resurrect them — delete instead so null truly removes.
     if (input.model === null) delete job.model
     if (input.deliverTo === null) delete job.deliverTo
+    if (input.assertCmd === null) delete job.assertCmd
     store.upsertJob(job)
     scheduleWake()
     respond(res, 200, { job })
@@ -1126,9 +1293,28 @@ export function apply(ctx, config) {
           jobs: jobs.length,
           enabled: jobs.filter((j) => j.enabled && j.state !== 'paused' && j.state !== 'completed').length,
           inflight: inflight.size,
+          failing: jobs.filter((j) => (j.consecutiveFailures ?? 0) > 0).length,
         },
         lastError: null,
-        detail: { lastTickAt, lockHeld: existsSync(store.lockPath) },
+        detail: {
+          lastTickAt,
+          lockHeld: existsSync(store.lockPath),
+          maxRuns: cfg.maxRuns,
+          assertTimeoutMs: cfg.assertTimeoutMs,
+          jobs: jobs.map((j) => ({
+            id: j.id,
+            name: j.name,
+            state: j.state,
+            enabled: j.enabled,
+            nextRunAt: j.nextRunAt ?? null,
+            lastRunAt: j.lastRunAt ?? null,
+            lastStatus: j.lastStatus ?? null,
+            lastRunAgeMs: j.lastRunAt ? Date.now() - Date.parse(j.lastRunAt) : null,
+            consecutiveFailures: j.consecutiveFailures ?? 0,
+            lastDispatchLatencyMs: j.lastDispatchLatencyMs ?? null,
+            assertCmd: Boolean(j.assertCmd),
+          })),
+        },
       })
     },
   })

@@ -290,3 +290,53 @@ test('dispatch jitter: due job waits trigger.jitterMaxMs before firing', async (
   assert.equal(done.status, 'succeeded')
   assert.equal(store.getJob(job.id).consecutiveFailures, 0)
 })
+
+// ── mechanical acceptance test (assertCmd) — 2026-09-12 audit ───────────────
+// `succeeded` used to mean "headless process exited 0", which the feed job
+// satisfied 15 times in a row while producing zero output. assertCmd is the
+// job's own acceptance test: non-zero ⇒ the run is failed.
+
+test('assertCmd passes → run succeeded, assertExitCode recorded', async (t) => {
+  const { ctx } = makeCtx()
+  const mod = await import(pluginHref)
+  const cfg = makeCfg()
+  mod.apply(ctx, cfg)
+  t.after(() => ctx._cleanup())
+  const { Store } = await import('../lib/store.mjs')
+  const store = new Store(cfg.dataDir)
+  const job = makeJob({ assertCmd: 'exit 0' })
+  store.upsertJob(job)
+
+  const done = await waitFor(() => store.listRuns(job.id).find((r) => r.evt === 'finish'))
+  assert.equal(done.status, 'succeeded')
+  assert.equal(done.assertExitCode, 0)
+  assert.ok(!done.assertFailed)
+  // Dispatch latency is recorded so host-asleep drift is auditable.
+  assert.equal(typeof done.dispatchLatencyMs, 'number')
+})
+
+test('assertCmd fails → run failed, no retry (deterministic), streak counted', async (t) => {
+  const { ctx } = makeCtx()
+  const mod = await import(pluginHref)
+  const cfg = makeCfg()
+  mod.apply(ctx, cfg)
+  t.after(() => ctx._cleanup())
+  const { Store } = await import('../lib/store.mjs')
+  const store = new Store(cfg.dataDir)
+  const job = makeJob({ assertCmd: 'echo "deliverable missing"; exit 7' })
+  store.upsertJob(job)
+
+  const done = await waitFor(() => store.listRuns(job.id).find((r) => r.evt === 'finish'))
+  assert.equal(done.status, 'failed')
+  assert.equal(done.assertFailed, true)
+  assert.equal(done.assertExitCode, 7)
+  assert.match(done.error, /assert failed \(exit 7\)/)
+  assert.match(done.error, /deliverable missing/)
+
+  const live = store.getJob(job.id)
+  assert.equal(live.consecutiveFailures, 1)
+  assert.equal(live.lastStatus, 'failed')
+  // Deterministic failure → no retryState (a retry would repeat side effects).
+  assert.equal(live.retryState, undefined)
+  assert.equal(distinctRunIds(store.listRuns(job.id)), 1)
+})

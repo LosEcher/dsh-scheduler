@@ -122,3 +122,12 @@ test('normalizeJob: null clears an existing model (not resurrected by spread)', 
   const merged = { ...existing, ...cleared }
   assert.equal('model' in merged, true, 'spread resurrects existing.model (route must delete)')
 })
+
+test('preflightExecution rejects missing or invalid CLI entries without retry', async () => {
+  const { preflightExecution } = await import(pluginHref)
+  assert.match(preflightExecution(null, '/tmp'), /CLI entry is missing/)
+  assert.match(preflightExecution({ args: [], source: 'x' }, '/tmp'), /CLI entry is missing/)
+  assert.match(preflightExecution({ args: ['bin.js'], source: 'ERR_MODULE_NOT_FOUND' }, '/tmp'), /invalid CLI entry/)
+  assert.match(preflightExecution({ args: ['bin.js'], source: 'profile@/tmp' }, ''), /workspace is empty/)
+  assert.equal(preflightExecution({ args: ['bin.js'], source: 'profile@/tmp' }, '/tmp'), null)
+})

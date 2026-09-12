@@ -100,9 +100,20 @@ DSH 内置 `@deepseek-ai/dsh-schedule`（`packages/schedule/schedule`），它�
 { "id": "run-...", "jobId": "job-...", "triggerKind": "scheduled" | "manual",
   "scheduledFor": "...", "status": "queued"|"running"|"succeeded"|"failed"|"skipped"|"cancelled",
   "exitCode": 0, "durationMs": 1234, "outputHead": "...(尾部 8KB)",
+  "dispatchLatencyMs": 41234,
+  "assertExitCode": 0,
   "delivery": { "status": "delivered"|"skipped"|"error", "sessionId": "...", "reason": "..." },
   "sessionDir": "...", "startedAt": "...", "completedAt": "..." }
 ```
+
+- `dispatchLatencyMs`（2026-09-12 审计新增）：实际派发时刻 − 计划时刻。宿主睡眠/阻塞会让 cron 任务迟到几十
+  分钟（macOS Clamshell Sleep 把 Node 定时器顺延到下一个 dark wake，实测 08:30 的任务有 9 次落在
+  08:48–09:00）。迟到 >5min 会打 `[dsh-scheduler] ... dispatched Nmin late` 警告日志；`/scheduler/status`
+  暴露每任务 `lastDispatchLatencyMs`。
+- `assertExitCode` / `assertFailed`（2026-09-12 审计新增）：见 §2.4 的机械验收断言。
+- **台账轮转**：`maxRuns`（默认 5000）行以内原地保留；超过 `rotateBytes`（2MB）时把最旧的若干行**归档**到
+  `archive/runs-<YYYY-MM>.jsonl`（按月分片，按行内 `startedAt`/`scheduledFor` 归月），**不再直接丢弃**。
+  旧版硬编码 `maxRuns=500` 会在轮转时丢掉约 90% 历史，使审计无法回溯。
 
 ### 2.3 调度循环
 
@@ -126,6 +137,16 @@ spawn(process.execPath,
 - **超时升级**：`timeoutMs`（默认 30min）到点发 SIGTERM，再等 `killGraceMs`（默认 10s）仍不退则 SIGKILL；台账记 `failed` + `error: timeout after Ns`；
 - 输出捕获：stdout/stderr 合并尾部 8KB 入台账 `outputHead`；
 - 退出码 0 → `succeeded`，非 0 → `failed`；
+- **机械验收断言（job.assertCmd，2026-09-12 审计新增）**：`exitCode=0` 只说明 headless 进程干净退出，
+  **不等于任务达成**（实证：feed 任务连续 15 次"成功"运行产出为零）。可选字段 `assertCmd`（shell 片段）
+  在进程干净退出后由 `/bin/bash -lc` 在任务 workspace 内执行（超时 `assertTimeoutMs`，默认 60s）：
+  非零 ⇒ 该次 run 记 `failed` + `assertFailed: true` + `assertExitCode`，`error` 前缀 `assert failed (exit N):`。
+  断言失败是**确定性失败，不重试**（重试只会重复副作用，例如已发出的通知），但计入连续失败计数并触发告警/熔断。
+  `null` 清除该字段（清除必须先于 `{...existing}` 展开，否则会被复活）。示例（要求当日产物存在、非空、新鲜）：
+
+  ```jsonc
+  "assertCmd": "f=\"$HOME/.dsh/scheduler-reports/los-governance-daily-$(date +%Y%m%d).md\"\n[ -s \"$f\" ] || { echo \"missing: $f\"; exit 1; }\n[ -n \"$(find \"$f\" -mmin -90)\" ] || { echo \"stale: $f\"; exit 1; }\necho ok: $f"
+  ```
 - **熔断**：连续失败达到 `maxConsecutiveFailures`（默认 5）→ 自动暂停（`enabled=false, state=paused, pausedReason=max_consecutive_failures`），UI 显示「已熔断暂停」，手动恢复后重新计数；
 - **自动重试（带上限）**：`maxAttempts`（默认 3，job 可覆盖 1-10）= 单次逻辑触发的总尝试次数，`retryDelayMs`（默认 60s，job 可覆盖 5s-30min）= 重试间隔。瞬时失败（网络 TRANSPORT/5xx/超时/任意非零退出）自动重试；**持续性失败不重试**（`isRetryableFailure` 识别 402/insufficient balance/quota/credit/401/403/billing/account suspended 等额度与认证类错误，重试只会浪费配额）。重试状态持久化在 job 的 `retryState`（由 tick 驱动，web 重启不丢、等待期不会重复触发）；每次尝试记一条 run（带 `attempt` 序号），重试中失败不递增熔断计数、不投递，最终结果才走 `applyRunResult` 与投递；耗尽上限仍失败则 run 标注 `gave up`；
 - **调度抖动（dispatch jitter，0.3.0）**：全局 `dispatchJitterMaxMs`（默认 180s，0 禁用）让每个定时任务在 cron 时刻后随机延迟 0-max 毫秒再执行——任务不再精确整点触发、彼此错开、避免与外部整点调度（如采集后端的 :00/:30 定时 run）撞车；单任务可用 `trigger.jitterMaxMs` 覆盖（0 即该任务不抖动）。手动触发与失败重试不走抖动（保持响应性）。
