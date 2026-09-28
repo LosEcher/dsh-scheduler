@@ -1327,20 +1327,23 @@ export function apply(ctx, config) {
       const method = req.method ?? 'GET'
       const parts = url.pathname.split('/').filter(Boolean) // [scheduler, jobs?, id?, action?]
       try {
-        if (method === 'GET' && (url.pathname === '/scheduler' || url.pathname === '/scheduler/status')) return routeStatus(r)
-        if (method === 'GET' && url.pathname === '/scheduler/jobs') return routeListJobs(r)
-        if (method === 'GET' && url.pathname === '/scheduler/preview') return routePreview(r, url)
-        if (method === 'POST' && url.pathname === '/scheduler/jobs') return routeCreateJob(r, req)
+        // 每条路由都必须 `return await`：这些 handler 都是 async，同步 `return promise`
+        // 不会把 rejection 交给下面的 catch —— 校验失败（缺 name/坏 cron）会变成
+        // 逃逸的 rejection（宿主侧表现为请求失败），而不是设计好的 400 invalid_input。
+        if (method === 'GET' && (url.pathname === '/scheduler' || url.pathname === '/scheduler/status')) return await routeStatus(r)
+        if (method === 'GET' && url.pathname === '/scheduler/jobs') return await routeListJobs(r)
+        if (method === 'GET' && url.pathname === '/scheduler/preview') return await routePreview(r, url)
+        if (method === 'POST' && url.pathname === '/scheduler/jobs') return await routeCreateJob(r, req)
         if (parts.length >= 3 && parts[0] === 'scheduler' && parts[1] === 'jobs') {
           const id = parts[2]
           const action = parts[3]
-          if (!action && method === 'GET') return routeGetJob(r, id)
-          if (!action && method === 'PATCH') return routeUpdateJob(r, id, req)
-          if (!action && method === 'DELETE') return routeDeleteJob(r, id)
-          if (action === 'trigger' && method === 'POST') return routeTriggerJob(r, id)
-          if (action === 'pause' && method === 'POST') return routePauseJob(r, id)
-          if (action === 'resume' && method === 'POST') return routeResumeJob(r, id)
-          if (action === 'runs' && method === 'GET') return routeJobRuns(r, id, url)
+          if (!action && method === 'GET') return await routeGetJob(r, id)
+          if (!action && method === 'PATCH') return await routeUpdateJob(r, id, req)
+          if (!action && method === 'DELETE') return await routeDeleteJob(r, id)
+          if (action === 'trigger' && method === 'POST') return await routeTriggerJob(r, id)
+          if (action === 'pause' && method === 'POST') return await routePauseJob(r, id)
+          if (action === 'resume' && method === 'POST') return await routeResumeJob(r, id)
+          if (action === 'runs' && method === 'GET') return await routeJobRuns(r, id, url)
         }
         return respond(r, 404, { code: 'not_found', message: `${method} ${url.pathname}` })
       } catch (error) {
