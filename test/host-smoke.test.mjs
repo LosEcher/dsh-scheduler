@@ -230,16 +230,39 @@ test('host 冒烟：真实宿主库加载入口 + 注入/路由契约 + CLI 解�
   }
 })
 
-test('host 冒烟：CLI 入口不可解析时必须抛带补救指引的错误（fail-closed，不静默降级）', { skip: SKIP }, async () => {
+test('host 冒烟：CLI 不可解析 ⇒ 不拖垮插件树，但每次运行按 preflight 失败（可排障、不静默）', { skip: SKIP }, async () => {
   const dshHome = mkdtempSync(join(tmpdir(), 'dsh-sched-nocli-'))
   const ctx = makeCtx()
   const savedHarnessDir = process.env.DSH_HARNESS_DIR
   try {
     const mod = await loadPlugin(dshHome)
     delete process.env.DSH_HARNESS_DIR
-    // 临时 DSH_HOME 下既无 source/current 也无 profiles 安装 ⇒ resolveCliEntry 必须抛
-    assert.throws(() => mod.apply(ctx, {}), /DSH_HARNESS_DIR/, '错误信息必须指出补救手段，否则线上排障无从下手')
-    assert.equal(ctx.routes.length, 0, '解析失败时不应留下半注册的路由')
+    // 临时 DSH_HOME 下既无 source/current 也无 profiles 安装 ⇒ 解析结果必须是 null。
+    // 关键：apply 不得抛——在 apply() 里抛异常会拖掉整棵 web 插件树（dsh-multimedia 2026-08-15 同款）。
+    mod.apply(ctx, {})
+    const pluginStatus = findRoute(ctx.routes, '/plugins/dsh-scheduler/status')
+    const scheduler = findRoute(ctx.routes, '/scheduler')
+    assert.ok(pluginStatus, '解析失败也要把状态路由注册好，否则 UI 没地方显示原因')
+
+    const st = await callRoute(pluginStatus, '/plugins/dsh-scheduler/status')
+    assert.equal(st.status, 200)
+    assert.equal(st.json.detail.cliEntry, null)
+    assert.match(st.json.detail.cliError, /DSH_HARNESS_DIR/, '状态里必须给出可操作的补救指引')
+
+    // 运行路径必须 fail-closed：建一个暂停 job 手动触发 ⇒ 记一行 failed，且绝不 spawn 进程
+    const created = await callRoute(scheduler, '/scheduler/jobs', 'POST', {
+      name: 'gate-nocli', prompt: 'noop', enabled: false, trigger: { kind: 'interval', expression: '1h' },
+    })
+    assert.equal(created.status, 201)
+    const jobId = created.json.job.id
+    const triggered = await callRoute(scheduler, `/scheduler/jobs/${jobId}/trigger`, 'POST')
+    assert.equal(triggered.status, 202)
+    const runs = await callRoute(scheduler, `/scheduler/jobs/${jobId}/runs`)
+    assert.equal(runs.status, 200)
+    assert.equal(runs.json.runs.length, 1, '预检失败也必须留一行运行台账（不能静默跳过）')
+    assert.equal(runs.json.runs[0].status, 'failed')
+    assert.match(String(runs.json.runs[0].error), /CLI entry is missing/)
+    assert.match(String(runs.json.runs[0].error), /DSH_HARNESS_DIR/)
   } finally {
     if (savedHarnessDir !== undefined) process.env.DSH_HARNESS_DIR = savedHarnessDir
     ctx.dispose()
