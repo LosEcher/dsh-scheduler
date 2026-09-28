@@ -131,10 +131,18 @@ const PREFLIGHT_ERROR_PATTERNS = [
   /cannot locate the dsh CLI/i,
 ]
 
+/**
+ * 解析不到 dsh CLI 时的补救指引。出现在三处，保证"红得可排障"：启动告警、
+ * /plugins/dsh-scheduler/status 的 cliError、以及每次运行的 preflight 失败行。
+ */
+export const CLI_ENTRY_REMEDY =
+  'dsh CLI 未找到：设置 DSH_HARNESS_DIR（或 harnessDir 配置）指向 harness 检出，'
+  + '或安装 dsh 使 ~/.dsh/profiles/node_modules/@deepseek-ai/dsh 存在。'
+
 /** Validate local execution prerequisites before spending an attempt. */
 export function preflightExecution(entry, workspace) {
   if (!entry || !Array.isArray(entry.args) || entry.args.length === 0) {
-    return 'preflight: dsh CLI entry is missing'
+    return `preflight: dsh CLI entry is missing — ${CLI_ENTRY_REMEDY}`
   }
   if (!workspace || !String(workspace).trim()) return 'preflight: workspace is empty'
   const source = String(entry.source ?? '')
@@ -498,7 +506,7 @@ export function apply(ctx, config) {
   //      root containing lib/bin.js (profile install shape)
   //   2. ~/.dsh/source/current  — harness source checkout convention
   //   3. $DSH_HOME/profiles/node_modules/@deepseek-ai/dsh  — profile install
-  //   4. clear error pointing at DSH_HARNESS_DIR / harnessDir config
+  //   4. 都解析不到 ⇒ 返回 null（由 preflightExecution 报错，并带上 DSH_HARNESS_DIR / harnessDir 的补救指引）
   function resolveCliEntry() {
     const dshHome = process.env.DSH_HOME ?? `${homedir()}/.dsh`
     const candidates = []
@@ -519,11 +527,10 @@ export function apply(ctx, config) {
       if (existsSync(pkgBin)) return { args: [pkgBin], source: `profile@${root}` }
     }
 
-    throw new Error(
-      'dsh-scheduler: cannot locate the dsh CLI. Set DSH_HARNESS_DIR (or the '
-      + 'harnessDir config) to the harness checkout, or install dsh via '
-      + '`npx @deepseek-ai/dsh` so ~/.dsh/profiles/node_modules/@deepseek-ai/dsh exists.',
-    )
+    // 不抛：解析失败交给 preflightExecution（每次运行记一行失败、可见可排障）。
+    // 在 apply() 里 eager 抛异常会拖掉整棵 web 插件树（dsh-multimedia 2026-08-15 事故同款），
+    // 而调度器本来就有一条"花钱前先验前置"的通道，没理由绕过它。
+    return null
   }
 
   // ---- executor -------------------------------------------------------------
@@ -1081,8 +1088,14 @@ export function apply(ctx, config) {
   }
 
   function start() {
+    if (!defaultEntry) {
+      ctx.logger.warn(
+        `[dsh-scheduler] ${CLI_ENTRY_REMEDY}——插件已加载，但每次运行会在 preflight 阶段失败并记一行 failed`
+        + '（不再让插件加载即抛异常拖掉整棵插件树）',
+      )
+    }
     ctx.logger.info(
-      `[dsh-scheduler] started: dataDir=${cfg.dataDir} cli=${defaultEntry.source} `
+      `[dsh-scheduler] started: dataDir=${cfg.dataDir} cli=${defaultEntry?.source ?? 'UNRESOLVED'} `
       + `maxConcurrent=${cfg.maxConcurrent} timeout=${Math.round(cfg.timeoutMs / 1000)}s `
       + `killGrace=${Math.round(cfg.killGraceMs / 1000)}s breaker=${cfg.maxConsecutiveFailures} `
       + `retry=${cfg.maxAttempts}x/${Math.round(cfg.retryDelayMs / 1000)}s `
@@ -1128,7 +1141,8 @@ export function apply(ctx, config) {
       enabledCount: jobs.filter((j) => j.enabled && j.state !== 'paused' && j.state !== 'completed').length,
       dataDir: cfg.dataDir,
       harnessDir: cfg.harnessDir,
-      cliEntry: defaultEntry.source,
+      cliEntry: defaultEntry?.source ?? null,
+      cliError: defaultEntry ? null : CLI_ENTRY_REMEDY,
       maxConcurrent: cfg.maxConcurrent,
       timeoutMs: cfg.timeoutMs,
       killGraceMs: cfg.killGraceMs,
@@ -1299,6 +1313,10 @@ export function apply(ctx, config) {
         detail: {
           lastTickAt,
           lockHeld: existsSync(store.lockPath),
+          // CLI 解析诊断：解析失败时插件照常加载（不拖垮插件树），问题在这里与
+          // 每次运行的 failed 台账行里可见 —— /plugins/<id>/status 是工具查询面。
+          cliEntry: defaultEntry?.source ?? null,
+          cliError: defaultEntry ? null : CLI_ENTRY_REMEDY,
           maxRuns: cfg.maxRuns,
           assertTimeoutMs: cfg.assertTimeoutMs,
           jobs: jobs.map((j) => ({
