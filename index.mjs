@@ -23,6 +23,7 @@
 import Schema from '@deepseek-ai/schemastery'
 import { createUserMessage } from '@deepseek-ai/dsh-llm'
 import { spawn } from 'node:child_process'
+import { createHash } from 'node:crypto'
 import { existsSync, mkdirSync, readFileSync, readdirSync, rmSync, unlinkSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { homedir } from 'node:os'
@@ -85,6 +86,14 @@ export const Config = Schema.object({
   maxRuns: Schema.number().min(100).default(5000),
   /** Per-run timeout for a job's assertCmd (its own mechanical acceptance test). */
   assertTimeoutMs: Schema.number().min(1_000).max(10 * 60_000).default(60_000),
+  /**
+   * 投递状态目录：与 ~/.dsh/scripts/feishu-push.sh 的 --key 状态目录同源
+   * （脚本默认 $DSH_HOME/storages/feishu-push）。scheduler 从这里**派生**交付事实
+   * （`<sha256(key) 前16位>.sent`），把「这次触发到底推了几条」变成台账里可查的
+   * 事件，而不是只验「报告文件存在」（2026-10-03 重复推送复盘：7 起重复全在
+   * assert 的盲区里）。
+   */
+  deliveryStateDir: Schema.string(),
   /** Max lateness for 'skip' catch-up; 0 = unlimited (never skip). */
   maxLatenessMs: Schema.number().min(0).default(15 * 60_000),
   /**
@@ -119,6 +128,7 @@ export function resolveConfig(config) {
     dispatchJitterMaxMs: config.dispatchJitterMaxMs ?? 3 * 60_000,
     maxRuns: config.maxRuns ?? 5000,
     assertTimeoutMs: config.assertTimeoutMs ?? 60_000,
+    deliveryStateDir: config.deliveryStateDir ?? `${dshHome}/storages/feishu-push`,
   }
 }
 
@@ -138,6 +148,42 @@ const PREFLIGHT_ERROR_PATTERNS = [
 export const CLI_ENTRY_REMEDY =
   'dsh CLI 未找到：设置 DSH_HARNESS_DIR（或 harnessDir 配置）指向 harness 检出，'
   + '或安装 dsh 使 ~/.dsh/profiles/node_modules/@deepseek-ai/dsh 存在。'
+
+/**
+ * 幂等键：一次 logical trigger 的**全部 attempt 共享**同一个 key。
+ * attempt 有意不进 key —— 「重试不该重发」正是靠这一点成立的
+ * （2026-10-03 事故：attempt2 推送成功后 4s 被杀，attempt3 换了报告文件名
+ * 当 key，于是又推了一条）。
+ */
+export function computeRunKey(jobId, scheduledFor) {
+  return `${jobId}|${scheduledFor}`
+}
+
+/** 与 feishu-push.sh 的 key_hash 逐位对齐：sha256(key) 的 hex 前 16 位。 */
+export function deliveryKeyHash(key) {
+  return createHash('sha256').update(String(key), 'utf8').digest('hex').slice(0, 16)
+}
+
+/**
+ * 从 push 脚本的 .sent 记录**派生**交付事实（读不到 = 未投递）。
+ * 纯读 + 容错：目录/文件缺失、写到一半、JSON 损坏一律返回 null，绝不抛
+ * （调用点在 finish 里，任何异常都会打断台账写入）。
+ */
+export function readDeliveryRecord(stateDir, key) {
+  if (!stateDir || !key) return null
+  try {
+    const raw = readFileSync(join(stateDir, `${deliveryKeyHash(key)}.sent`), 'utf8')
+    const rec = JSON.parse(raw)
+    return {
+      channel: typeof rec.channel === 'string' ? rec.channel : 'feishu',
+      key,
+      messageId: typeof rec.messageId === 'string' ? rec.messageId : null,
+      sentAt: typeof rec.sentAt === 'string' ? rec.sentAt : null,
+    }
+  } catch {
+    return null
+  }
+}
 
 /** Validate local execution prerequisites before spending an attempt. */
 export function preflightExecution(entry, workspace) {
@@ -444,6 +490,22 @@ export function normalizeJob(input, existing) {
   if (input.assertCmd !== undefined) {
     assertCmd = input.assertCmd === null ? undefined : (String(input.assertCmd).trim().slice(0, 4000) || undefined)
   }
+  // notify: 声明这个 job 会向渠道推送 ⇒ scheduler 跟踪其交付。
+  //   { channel: 'feishu', require: false }
+  //   presence = 跟踪（把 .sent 派生成台账里的 push 字段 + status 路由可见）
+  //   require: true = 交付缺失即判本次运行失败并可重试（默认关：先观测遵守率，
+  //   避免"模型没按 key 调用"把机制本身变成重复推送源）。null 清除。
+  let notify = existing?.notify
+  if (input.notify !== undefined) {
+    if (input.notify === null) {
+      notify = undefined
+    } else if (typeof input.notify === 'object') {
+      const channel = String(input.notify.channel ?? 'feishu').trim() || 'feishu'
+      notify = { channel, require: input.notify.require === true }
+    } else {
+      throw new Error('notify must be an object {channel, require?} or null')
+    }
+  }
   return {
     name, prompt, trigger, workspace, enabled,
     ...(deliverTo ? { deliverTo } : {}),
@@ -452,6 +514,7 @@ export function normalizeJob(input, existing) {
     ...(retryDelayMs !== undefined ? { retryDelayMs } : {}),
     ...(model ? { model } : {}),
     ...(assertCmd ? { assertCmd } : {}),
+    ...(notify ? { notify } : {}),
   }
 }
 
@@ -487,6 +550,13 @@ export function selectModelForAttempt(model, attempt) {
 export function apply(ctx, config) {
   const cfg = resolveConfig(config)
   const inflight = new Map() // jobId -> runId
+  /**
+   * jobId -> 最近一次渠道推送结果（内存投影，供 /scheduler/status 查询）。
+   * 不读台账是为了让状态路由保持 O(1)：它会被探针按秒级轮询，而 runs.jsonl
+   * 已经 2MB+，每次探测都全量解析不划算。重启后为空（可接受：这是观测便利，
+   * 权威仍在 runs.jsonl 的 finish 行 `push` 字段）。
+   */
+  const pushState = new Map()
   /** jobId -> fireAt(ms): a due scheduled occurrence waiting out its dispatch jitter. */
   const jitterPending = new Map()
   const store = new Store(cfg.dataDir, {
@@ -644,8 +714,22 @@ export function apply(ctx, config) {
     // audit) is visible in the ledger instead of hidden behind a green status.
     const scheduledMs = Date.parse(scheduledFor)
     const dispatchLatencyMs = Number.isFinite(scheduledMs) ? Math.max(0, Date.now() - scheduledMs) : undefined
+    // 幂等键 + 子进程环境：agent 侧（headless 里只有 bash，没有 channel 工具）
+    // 用 $DSH_SCHED_RUN_KEY 作 feishu-push.sh --key，于是**同一次触发的所有
+    // attempt 共用一个 key**，重试/自我纠正都推不出第二条（脚本层 claim→send→commit）。
+    // 同时把 runKey 写进 start/finish 台账，交付事实可按 key 反查。
+    const runKey = computeRunKey(job.id, scheduledFor)
+    const runEnv = {
+      ...process.env,
+      DSH_SCHED_JOB_ID: job.id,
+      DSH_SCHED_RUN_KEY: runKey,
+      DSH_SCHED_SCHEDULED_FOR: String(scheduledFor ?? ''),
+      DSH_SCHED_ATTEMPT: String(attempt),
+      DSH_SCHED_DELIVERY_STATE_DIR: cfg.deliveryStateDir,
+    }
     const run = {
       id: runId, jobId: job.id, triggerKind, scheduledFor, attempt, evt: 'start', status: 'running', startedAt,
+      runKey,
       ...(dispatchLatencyMs !== undefined && attempt === 1 ? { dispatchLatencyMs } : {}),
     }
     store.appendRun(run)
@@ -655,7 +739,10 @@ export function apply(ctx, config) {
         + `for job "${job.name}" (${job.id}); scheduled ${scheduledFor} — host was asleep or blocked`,
       )
     }
-    ctx.logger.info(`[dsh-scheduler] fire job "${job.name}" (${job.id}) run=${runId} trigger=${triggerKind}`)
+    ctx.logger.info(
+      `[dsh-scheduler] fire job "${job.name}" (${job.id}) run=${runId} trigger=${triggerKind}`
+      + `${runKey ? ` runKey=${runKey}` : ''}`,
+    )
 
     // Dispatch-time accounting: advance nextRunAt *now*, before the run
     // settles. If the host crashes after dispatch, the restarted scheduler
@@ -720,7 +807,7 @@ export function apply(ctx, config) {
       job.prompt,
     ], {
       cwd: workspace,
-      env: process.env,
+      env: runEnv,
       stdio: ['ignore', 'pipe', 'pipe'],
     })
     child.stdout.on('data', (d) => { output = tail(output + d.toString('utf8')) })
@@ -785,7 +872,7 @@ export function apply(ctx, config) {
         try {
           child = spawn('/bin/bash', ['-lc', cmd], {
             cwd: workspace,
-            env: process.env,
+            env: runEnv,
             stdio: ['ignore', 'pipe', 'pipe'],
           })
         } catch (error) {
@@ -826,6 +913,21 @@ export function apply(ctx, config) {
         cleanupModelOverride(modelOverride)
         if (!inflight.has(job.id) || inflight.get(job.id) !== runId) return
         inflight.delete(job.id)
+      // 交付事实（2026-10-03 复盘）：job 声明了 notify 才跟踪。必须在判定
+      // willRetry 之前算出来，require 门禁才能参与成败判定。
+      // 权威来源是 push 脚本的 .sent（脚本才是发送方），scheduler 只派生。
+      const pushRecord = job.notify ? readDeliveryRecord(cfg.deliveryStateDir, runKey) : null
+      if (job.notify?.require === true && result.status === 'succeeded' && !pushRecord) {
+        // 交付门禁：脚本层没有该 runKey 的 .sent ⇒ 这次触发没送达。记 failed 且
+        // **允许重试**——重试会再跑一遍 prompt，而 .sent 仍然缺失，所以补发不会被
+        // 脚本层当成重复；反过来若已送达，.sent 在，重试也推不出第二条。
+        result = {
+          ...result,
+          status: 'failed',
+          deliveryMissing: true,
+          error: `delivery missing for key "${runKey}"（在 ${cfg.deliveryStateDir} 找不到 .sent）`,
+        }
+      }
       const completedAt = nowIso()
       const durationMs = Date.now() - startedMs
       const maxAttempts = job.maxAttempts ?? cfg.maxAttempts
@@ -849,6 +951,14 @@ export function apply(ctx, config) {
       } else if (failed && attempt > 1) {
         finalRun.error = (finalRun.error ? `${finalRun.error}; ` : '')
           + `[attempt ${attempt}/${maxAttempts}] gave up`
+      }
+      // 交付写进台账（与 deliverTo 的 `delivery` 字段区分开：那是"投递到目标
+      // 会话"，这里是"推送到渠道"。两条链路的失败模式完全不同，不能共用一个字段）。
+      if (job.notify) {
+        finalRun.push = pushRecord
+          ? { status: 'delivered', ...pushRecord }
+          : { status: 'missing', channel: job.notify.channel ?? 'feishu', key: runKey }
+        pushState.set(job.id, { ...finalRun.push, runId, at: completedAt })
       }
       // Defer delivery (target-session notification) until the final outcome.
       // NOTE: `delivery` must be function-scoped — the success log below
@@ -968,8 +1078,15 @@ export function apply(ctx, config) {
       run.error ? `- 错误: ${String(run.error).slice(0, 200)}` : null,
       head ? `- 输出: ${head}` : null,
     ].filter(Boolean).join('\n')
+    // 告警也走幂等键：key 含 job + 触发时刻 + 失败链长度。同一次触发的告警
+    // 只发一条（水位已挡重发，这里再挡一层"重启/重试窗口内水位未落盘"的重复；
+    // 失败链变长 ⇒ 新 key ⇒ 能继续升级告警，不会被误吞）。
+    const alertKey = `${job.id}|${run.scheduledFor}|alert|${updated.consecutiveFailures}`
     try {
-      const child = spawn('bash', [script, text], { stdio: ['ignore', 'ignore', 'pipe'] })
+      const child = spawn('bash', [script, '--key', alertKey, '--max-chars', '500', text], {
+        stdio: ['ignore', 'ignore', 'pipe'],
+        env: { ...process.env, FEISHU_PUSH_STATE_DIR: cfg.deliveryStateDir },
+      })
       child.stderr.on('data', (d) => {
         ctx.logger.warn(`[dsh-scheduler] failure alert stderr: ${String(d).slice(0, 200)}`)
       })
@@ -1308,6 +1425,10 @@ export function apply(ctx, config) {
           enabled: jobs.filter((j) => j.enabled && j.state !== 'paused' && j.state !== 'completed').length,
           inflight: inflight.size,
           failing: jobs.filter((j) => (j.consecutiveFailures ?? 0) > 0).length,
+          // 交付面：跟踪投递的 job 数 / 最近一次投递缺失的 job 数。assertCmd 只看
+          // 报告文件，这是唯一能看出「发了几条」的计数（2026-10-03 复盘）。
+          notifyJobs: jobs.filter((j) => j.notify).length,
+          pushMissing: [...pushState.values()].filter((v) => v.status !== 'delivered').length,
         },
         lastError: null,
         detail: {
@@ -1319,6 +1440,8 @@ export function apply(ctx, config) {
           cliError: defaultEntry ? null : CLI_ENTRY_REMEDY,
           maxRuns: cfg.maxRuns,
           assertTimeoutMs: cfg.assertTimeoutMs,
+          deliveryStateDir: cfg.deliveryStateDir,
+          lastPush: Object.fromEntries(pushState),
           jobs: jobs.map((j) => ({
             id: j.id,
             name: j.name,
@@ -1331,6 +1454,7 @@ export function apply(ctx, config) {
             consecutiveFailures: j.consecutiveFailures ?? 0,
             lastDispatchLatencyMs: j.lastDispatchLatencyMs ?? null,
             assertCmd: Boolean(j.assertCmd),
+            notify: j.notify ?? null,
           })),
         },
       })

@@ -2,6 +2,81 @@
 
 DSH 的定时任务（cron / interval / once）插件：宿主半包负责**持久化任务定义、调度、执行与运行台账**，客户端半包在会话内提供**「定时任务」管理页**（列表 / 新建 / 触发 / 暂停 / 运行历史）。
 
+## 〇、0.4.0 变更要点（2026-09-12，commit cc42607）
+
+> 本节补写于 2026-09-22（此前 README 只写到 0.3.0，版本表与实际 0.4.0 实装不一致）。
+
+### 0.4.1 机械验收断言 `job.assertCmd`
+
+- 语义：run **干净退出后**再跑一次该任务的验收命令（`/bin/bash -lc <assertCmd>`，cwd = 任务的 workspace，env 继承宿主），失败即把本次 run 记为 failed。
+- 目的：补上「**exit 0 ≠ 任务达成**」这一漏洞（2026-09-12 审计实证：feed 空转 15 次仍全绿）。
+- 约束：`assertCmd` 最长 4000 字符；`assertTimeoutMs` 默认 60s（min 1s / max 10min）；断言失败视为**不可重试**（确定性条件，重试会重复副作用，例如已推送的通知），但仍计入失败连击。
+- 运维现状（2026-09-22 复核本机 9 个 job）：7 个已声明 `assertCmd`，**2 个未声明**（hermes 日报归档 `job-9e2e7232-885`、磁盘清理 `job-3bff9079b397`）——这两个仍只有「exit 0」语义，属于已知缺口。
+
+### 0.4.2 台账归档轮转（取代破坏性裁剪）
+
+- `runs.jsonl` 超过 `rotateBytes`（默认 2 MiB）时触发轮转：**保留最新 `maxRuns` 行（默认 5000）**，其余**追加**到 `archive/runs-<YYYY-MM>.jsonl`。
+- 关键：**nothing is dropped** —— 此前实现是按行裁剪丢弃旧台账（2026-09-12 审计估算裁后只剩 ~41 天），现在旧段可审计/可回填，`archive/` 即为分段来源。
+- 本机现状：`runs.jsonl` 4999 行 / 1.90 MB，正好在阈值边缘（下一次运行触发首轮轮转）。
+
+### 0.4.3 派发延迟可见性
+
+- attempt 1 的 run 事件记录 `dispatchLatencyMs` = 实际派发时刻 − `nextRunAt` 计划时刻；`> 5min` 记一条 warn 日志。
+- `job.lastDispatchLatencyMs` 持久化，便于区分「任务没跑」与「跑了但被睡眠/backoff 顺延」——此前只能靠 `pmset` dark wake 时序反推。
+
+### 0.4.4 尚未包含（避免误读）
+
+- 纯脚本任务仍走 headless agent（调度器只有 agent 一条执行路径），没有 shell 直跑类型。
+- ~~定时任务失败**没有推送告警**~~ → 已由 `pushFailureAlert`（0.3.x，`alertOnConsecutiveFailures`
+  默认 2、按失败链水位去重）落地；0.5.0 起该告警也带幂等键。
+
+### 0.5.0 交付幂等与交付台账（2026-10-03，重复推送复盘）
+
+**背景**：30 天飞书历史里 88 条定时任务消息命中 **7 起重复推送**（一次触发推 2–4 条）。
+根因不是"任务跑了两次"，而是"**推送这件事没有幂等语义**"：
+
+- 6/7 起是同一次 run 内模型自我纠正重发（prompt 写"摘要 >500 字截断到 500 以内"，
+  模型先发长版、发现超限后再发一版合规的）；
+- 1/7 起是超时重试整段重跑（attempt2 于 07:16:34 推送成功后 4s 被 SIGKILL，
+  当日去重标记没落地，attempt3 于 07:18:02 又推一条）；
+- 而 `assertCmd` 只验「报告文件存在/非空/新鲜」，**完全不验「发了几条」**，
+  `runs.jsonl` 也不记交付 ⇒ 重复全在检查链路的盲区里，持续了一个月。
+
+**A. runKey 注入（幂等键的正确粒度）**
+
+- 每次触发计算 `runKey = <jobId>|<scheduledFor>`，**attempt 不进 key**，并注入子进程环境：
+  `DSH_SCHED_RUN_KEY` / `DSH_SCHED_JOB_ID` / `DSH_SCHED_SCHEDULED_FOR` / `DSH_SCHED_ATTEMPT` /
+  `DSH_SCHED_DELIVERY_STATE_DIR`（headless 与 assertCmd 两个 spawn 都注入）。
+- 于是 agent 侧 `feishu-push.sh --key "$DSH_SCHED_RUN_KEY"` 天然让**同一次触发的所有
+  attempt 共用一个幂等键**，脚本层（claim→send→commit）据此拒发第二条。
+- `runKey` 同时写进 start/finish 台账行，交付事实可按 key 反查。
+
+**B. 交付台账（从 push 脚本的 `.sent` 派生，scheduler 不自己发消息）**
+
+- job 声明 `notify: { channel: 'feishu', require?: bool }` 即开启跟踪（缺省关闭，不打扰
+  不推送的 job）。scheduler 按 `sha256(runKey)` 前 16 位读
+  `<deliveryStateDir>/<hash>.sent`（默认 `~/.dsh/storages/feishu-push`，与 push 脚本同源，
+  hash 算法已由门禁锁为跨语言契约）。
+- finish 行新增 `push` 字段：`{status:'delivered', messageId, sentAt, key, channel}` 或
+  `{status:'missing', key, channel}` —— **与 `delivery`（投递到目标会话）是两个字段**，
+  两条链路的失败模式不同，不共用一个名字。
+- `notify.require=true` 时交付缺失即判本次失败，且**允许重试**（`.sent` 仍缺失 ⇒ 补发
+  不会被脚本当成重复；反之已送达则 `.sent` 在，重试推不出第二条）。默认 `false`：
+  先观测模型对 `--key` 的遵守率，避免"机制本身变成重复推送源"。
+
+**C. 失败告警带 key**：`<jobId>|<scheduledFor>|alert|<consecutiveFailures>` —— 同一次触发
+只告警一次，失败链变长则换 key 继续升级，不会被误吞。
+
+**D. 观测面**：`/plugins/dsh-scheduler/status` 新增 `counts.notifyJobs` / `counts.pushMissing` /
+`detail.deliveryStateDir` / `detail.lastPush`（内存投影，读台账会让秒级探测变重）。
+
+**E. 配套门禁**（在 dsfolder，非本仓）：
+`scripts/feishu-delivery-audit.mjs` 从飞书侧按「任务类别 + 20 分钟窗口」聚类，一次触发
+>1 条即 exit 1；`scripts/feishu-push-selftest.sh` 锁住 push 脚本的幂等与截断语义（9 离线 + 1 live）。
+
+> 生效前提：host 插件无 HMR，本改动需**重载 dsh web** 才生效；prompt 侧已用
+> `${DSH_SCHED_RUN_KEY:-<旧 key>}` 做过过渡（重载前回落旧行为，重载后自动升级为 runKey）。
+
 ## 一、调研结论：为什么需要这个插件
 
 ### 1.1 DSH 现状（2026-08-15 核查）
