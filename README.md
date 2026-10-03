@@ -44,11 +44,21 @@ DSH 的定时任务（cron / interval / once）插件：宿主半包负责**持�
 
 **A. runKey 注入（幂等键的正确粒度）**
 
-- 每次触发计算 `runKey = <jobId>|<scheduledFor>`，**attempt 不进 key**，并注入子进程环境：
-  `DSH_SCHED_RUN_KEY` / `DSH_SCHED_JOB_ID` / `DSH_SCHED_SCHEDULED_FOR` / `DSH_SCHED_ATTEMPT` /
-  `DSH_SCHED_DELIVERY_STATE_DIR`（headless 与 assertCmd 两个 spawn 都注入）。
-- 于是 agent 侧 `feishu-push.sh --key "$DSH_SCHED_RUN_KEY"` 天然让**同一次触发的所有
+- 每次触发计算 `runKey = <jobId>|<scheduledFor>`，**attempt 不进 key**。
+- **传递通道 = prompt 占位符替换**（不是环境变量）：`job.prompt` 里的
+  `{{DSH_SCHED_RUN_KEY}}` 在 spawn 前被替换成本次触发的 runKey。子进程 env 仍照常
+  注入 `DSH_SCHED_RUN_KEY` 等 5 个变量，但**不作为依赖**——原因见下。
+  > **为什么不能用 env**（2026-10-03 端到端探针实测）：DSH 的 bash 工具**不继承
+  > process.env**——其 spawn 的 env 是 `ENV_OVERRIDES + spec.env + dshEnv`，而
+  > `dshEnv` 来自 `ShellEnvRegistry.collect()`，契约写明「每次模型 shell 调用都
+  > 重建，ambient `DSH_*` 一律被 executor 丢弃」
+  > （`packages/shell/shell-env/src/index.ts:81-85`）。注入子进程 env 后 agent 的
+  > bash 里读不到该变量 —— 探针因此红了第一次上线。prompt 替换不依赖任何 shell
+  > 环境，是让幂等键到达推送点的唯一可靠通道。
+- 于是 agent 侧 `feishu-push.sh --key "{{DSH_SCHED_RUN_KEY}}"` 让**同一次触发的所有
   attempt 共用一个幂等键**，脚本层（claim→send→commit）据此拒发第二条。
+- `renderPrompt()` 对不含占位符的 prompt **原样返回**（既有 job 零影响）；runKey 为空
+  时也原样返回 —— 绝不把占位符留成字面量，否则所有 job 会共用同一个假 key 互相 dedup。
 - `runKey` 同时写进 start/finish 台账行，交付事实可按 key 反查。
 
 **B. 交付台账（从 push 脚本的 `.sent` 派生，scheduler 不自己发消息）**

@@ -253,6 +253,41 @@ test('notify.require=true + 已推送 → 仍判成功（门禁不得吞掉正�
   assert.equal(store.getJob(job.id).consecutiveFailures, 0)
 })
 
+test('renderPrompt：占位符全部替换；无占位符或 runKey 为空时原样返回', async () => {
+  const mod = await import(pluginHref)
+  const key = 'job-x|2026-10-03T05:35:00.000Z'
+  assert.equal(mod.renderPrompt('--key "{{DSH_SCHED_RUN_KEY}}"', key), `--key "${key}"`)
+  assert.equal(
+    mod.renderPrompt('a {{DSH_SCHED_RUN_KEY}} b {{DSH_SCHED_RUN_KEY}}', key),
+    `a ${key} b ${key}`,
+    '多处占位符都要替换',
+  )
+  assert.equal(mod.renderPrompt('无占位符的旧 job', key), '无占位符的旧 job')
+  // 负向控制：runKey 缺失时不能把占位符留成字面量——那会让所有 job 共用一个假 key
+  // 而互相 dedup 掉。
+  assert.equal(mod.renderPrompt('--key "{{DSH_SCHED_RUN_KEY}}"', ''), '--key "{{DSH_SCHED_RUN_KEY}}"')
+  assert.ok(!mod.renderPrompt('--key "{{DSH_SCHED_RUN_KEY}}"', '').includes('job-'))
+})
+
+test('端到端：spawn 给 agent 的 prompt 里占位符已换成 runKey（bash 工具不继承 env，这是唯一通道）', async (t) => {
+  const { ctx } = makeCtx()
+  const mod = await import(pluginHref)
+  const cfg = makeCfg()
+  mod.apply(ctx, cfg)
+  t.after(() => ctx._cleanup())
+  const { Store } = await import('../lib/store.mjs')
+  const store = new Store(cfg.dataDir)
+  const job = makeJob({ prompt: '__ECHO_PROMPT__ --key "{{DSH_SCHED_RUN_KEY}}" --max-chars 500' })
+  store.upsertJob(job)
+
+  const done = await waitFor(() => store.listRuns(job.id).find((r) => r.evt === 'finish'))
+  assert.equal(done.status, 'succeeded')
+  const m = /PROMPT=.*--key "([^"]+)"/.exec(done.outputHead ?? '')
+  assert.ok(m, `prompt 回显里应有 --key 实参：${(done.outputHead ?? '').slice(0, 200)}`)
+  assert.equal(m[1], done.runKey, 'agent 收到的 key 必须是本次触发的 runKey')
+  assert.ok(!(done.outputHead ?? '').includes('{{DSH_SCHED_RUN_KEY}}'), '占位符不得残留成字面量')
+})
+
 test('非 notify job 不产生 push 字段（不打扰既有 jobs）', async (t) => {
   const { ctx } = makeCtx()
   const mod = await import(pluginHref)

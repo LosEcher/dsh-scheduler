@@ -32,6 +32,14 @@ if (prompt.includes('__NOENV__')) {
   process.exit(0)
 }
 
+// 回显收到的 prompt：用于断言「spawn 传给 agent 的是替换后的 prompt」。
+// 注意这只证明参数到位；真机上 prompt 是 agent 的唯一指令通道（bash 工具不继承
+// 进程 env），所以这正是幂等键到达推送点的端到端判据。
+if (prompt.includes('__ECHO_PROMPT__')) {
+  process.stdout.write(`PROMPT=${prompt}\n`)
+  process.exit(0)
+}
+
 if (prompt.includes('__HANG__')) {
   const ms = Number(process.env.FAKE_HANG_MS ?? 3000)
   setTimeout(() => process.exit(0), ms)

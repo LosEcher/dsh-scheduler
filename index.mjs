@@ -150,6 +150,29 @@ export const CLI_ENTRY_REMEDY =
   + '或安装 dsh 使 ~/.dsh/profiles/node_modules/@deepseek-ai/dsh 存在。'
 
 /**
+ * prompt 占位符：scheduler 在 spawn 前替换成本次触发的 runKey。
+ *
+ * 为什么不用环境变量（2026-10-03 端到端探针实测踩到）：DSH 的 bash 工具
+ * **不继承 process.env** —— spawn 的 env 是 `ENV_OVERRIDES + spec.env + dshEnv`，
+ * 而 dshEnv 来自 `ShellEnvRegistry.collect()`，其契约写明「每次模型 shell 调用都
+ * 重建，ambient DSH_* 一律被 executor 丢弃」（packages/shell/shell-env/src/index.ts）。
+ * 往子进程 env 塞 DSH_SCHED_RUN_KEY，agent 的 bash 里根本看不到。
+ * prompt 替换不依赖任何 shell 环境，是让幂等键到达推送点的最短路径。
+ */
+export const RUN_KEY_PLACEHOLDER = '{{DSH_SCHED_RUN_KEY}}'
+
+/**
+ * 把 prompt 里的 runKey 占位符替换成本次触发的 runKey。
+ * 无可替换内容时**原样返回**（旧 job 不受影响）；runKey 为空时也原样返回，
+ * 绝不把占位符留成字面量——否则所有 job 会共用同一个假 key，互相 dedup 掉。
+ */
+export function renderPrompt(prompt, runKey) {
+  const text = String(prompt ?? '')
+  if (!runKey || !text.includes(RUN_KEY_PLACEHOLDER)) return text
+  return text.split(RUN_KEY_PLACEHOLDER).join(runKey)
+}
+
+/**
  * 幂等键：一次 logical trigger 的**全部 attempt 共享**同一个 key。
  * attempt 有意不进 key —— 「重试不该重发」正是靠这一点成立的
  * （2026-10-03 事故：attempt2 推送成功后 4s 被杀，attempt3 换了报告文件名
@@ -801,10 +824,13 @@ export function apply(ctx, config) {
       )
     }
 
+    // prompt 里的 runKey 占位符在此替换：这是 runKey 到达 agent（进而到达
+    // feishu-push.sh --key）的**唯一可靠通道**——bash 工具的环境由 shellEnv
+    // registry 重建，不继承进程 env（见 RUN_KEY_PLACEHOLDER 注释）。
     const child = spawn(process.execPath, [
       ...defaultEntry.args, '--profile', 'headless',
       ...(modelOverride ? ['--patch', modelOverride.patchPath] : []),
-      job.prompt,
+      renderPrompt(job.prompt, runKey),
     ], {
       cwd: workspace,
       env: runEnv,
