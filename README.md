@@ -65,14 +65,22 @@ DSH 的定时任务（cron / interval / once）插件：宿主半包负责**持�
 
 - job 声明 `notify: { channel: 'feishu', require?: bool }` 即开启跟踪（缺省关闭，不打扰
   不推送的 job）。scheduler 按 `sha256(runKey)` 前 16 位读
-  `<deliveryStateDir>/<hash>.sent`（默认 `~/.dsh/storages/feishu-push`，与 push 脚本同源，
-  hash 算法已由门禁锁为跨语言契约）。
-- finish 行新增 `push` 字段：`{status:'delivered', messageId, sentAt, key, channel}` 或
-  `{status:'missing', key, channel}` —— **与 `delivery`（投递到目标会话）是两个字段**，
-  两条链路的失败模式不同，不共用一个名字。
-- `notify.require=true` 时交付缺失即判本次失败，且**允许重试**（`.sent` 仍缺失 ⇒ 补发
+  `<deliveryStateDir>/<hash>.{sent,skipped}`（默认 `~/.dsh/storages/feishu-push`，与 push
+  脚本同源，hash 算法已由门禁锁为跨语言契约）。
+- finish 行新增 `push` 字段，**三态**：
+
+  | 标记 | status | 含义 |
+  |---|---|---|
+  | `<hash>.sent` | `delivered` | 真的发了（含 messageId/sentAt） |
+  | `<hash>.skipped` | `skipped` | **有意不推送**（合法）——由 `feishu-push.sh --skip` 写；例：feed 当日故障已通知过就静默，避免同日重复打扰 |
+  | 都没有 | `missing` | 该发而没发 —— **唯一该判失败的那种** |
+
+  > 为什么必须三态（2026-10-03 实测）：只认 `.sent` 时，21:35 那次 run **正确静默**
+  > 却被记成 missing，`notify.require` 因此永远开不起来（每次走静默分支都假红）。
+- **与 `delivery`（投递到目标会话）是两个字段**：两条链路的失败模式不同，不共用一个名字。
+- `notify.require=true` 时**只有 missing** 判本次失败，且**允许重试**（标记仍缺失 ⇒ 补发
   不会被脚本当成重复；反之已送达则 `.sent` 在，重试推不出第二条）。默认 `false`：
-  先观测模型对 `--key` 的遵守率，避免"机制本身变成重复推送源"。
+  先观测遵守率，避免"机制本身变成重复推送源"。
 
 **C. 失败告警带 key**：`<jobId>|<scheduledFor>|alert|<consecutiveFailures>` —— 同一次触发
 只告警一次，失败链变长则换 key 继续升级，不会被误吞。

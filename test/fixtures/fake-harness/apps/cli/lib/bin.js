@@ -40,22 +40,38 @@ if (prompt.includes('__ECHO_PROMPT__')) {
   process.exit(0)
 }
 
+// 从 prompt 里解析 agent 实际会用的 --key（真机上 bash 工具不继承进程 env，
+// prompt 占位符替换是唯一通道 —— fixture 按同语义取值，不用 env 作弊）。
+function keyFromPrompt(p) {
+  const m = /--key\s+"?([^"\s]+)"?/.exec(p)
+  return m?.[1] ?? null
+}
+
 if (prompt.includes('__HANG__')) {
   const ms = Number(process.env.FAKE_HANG_MS ?? 3000)
   setTimeout(() => process.exit(0), ms)
 } else if (prompt.includes('__FAIL__')) {
   fail('fake failure for test')
-} else if (prompt.includes('__PUSH__')) {
-  const key = process.env.DSH_SCHED_RUN_KEY
+} else if (prompt.includes('__PUSH__') || prompt.includes('__SKIP__')) {
+  const key = keyFromPrompt(prompt)
   const stateDir = process.env.DSH_SCHED_DELIVERY_STATE_DIR
-  if (!key || !stateDir) fail('__PUSH__ requires DSH_SCHED_RUN_KEY + DSH_SCHED_DELIVERY_STATE_DIR')
+  if (!key || !stateDir) fail('__PUSH__/__SKIP__ requires a --key in the prompt + DSH_SCHED_DELIVERY_STATE_DIR')
   const hash = createHash('sha256').update(key, 'utf8').digest('hex').slice(0, 16)
   mkdirSync(stateDir, { recursive: true })
-  writeFileSync(
-    join(stateDir, `${hash}.sent`),
-    JSON.stringify({ key, messageId: 'om_fake_test', sentAt: new Date().toISOString() }),
-    'utf8',
-  )
+  if (prompt.includes('__SKIP__')) {
+    // 模拟 feishu-push.sh --skip：只写"合法静默"标记，不发送。
+    writeFileSync(
+      join(stateDir, `${hash}.skipped`),
+      JSON.stringify({ key, reason: 'fake skip', at: new Date().toISOString() }),
+      'utf8',
+    )
+  } else {
+    writeFileSync(
+      join(stateDir, `${hash}.sent`),
+      JSON.stringify({ key, messageId: 'om_fake_test', sentAt: new Date().toISOString() }),
+      'utf8',
+    )
+  }
   process.exit(0)
 } else {
   process.exit(0)

@@ -175,7 +175,7 @@ test('notify job + 推送成功 → 台账 push=delivered（含 messageId），�
   t.after(() => ctx._cleanup())
   const { Store } = await import('../lib/store.mjs')
   const store = new Store(cfg.dataDir)
-  const job = makeJob({ prompt: '__PUSH__ 推一条', notify: { channel: 'feishu' } })
+  const job = makeJob({ prompt: '__PUSH__ --key "{{DSH_SCHED_RUN_KEY}}" --max-chars 500 推一条', notify: { channel: 'feishu' } })
   store.upsertJob(job)
 
   const done = await waitFor(() => store.listRuns(job.id).find((r) => r.evt === 'finish'))
@@ -244,13 +244,67 @@ test('notify.require=true + 已推送 → 仍判成功（门禁不得吞掉正�
   t.after(() => ctx._cleanup())
   const { Store } = await import('../lib/store.mjs')
   const store = new Store(cfg.dataDir)
-  const job = makeJob({ prompt: '__PUSH__ 推一条', notify: { channel: 'feishu', require: true } })
+  const job = makeJob({ prompt: '__PUSH__ --key "{{DSH_SCHED_RUN_KEY}}" --max-chars 500 推一条', notify: { channel: 'feishu', require: true } })
   store.upsertJob(job)
 
   const done = await waitFor(() => store.listRuns(job.id).find((r) => r.evt === 'finish'))
   assert.equal(done.status, 'succeeded')
   assert.equal(done.push.status, 'delivered')
   assert.equal(store.getJob(job.id).consecutiveFailures, 0)
+})
+
+test('三态：合法静默（--skip 写 .skipped）→ push=skipped，且 require 下仍判成功', async (t) => {
+  const { ctx, routes } = makeCtx()
+  const mod = await import(pluginHref)
+  const cfg = makeCfg()
+  mod.apply(ctx, cfg)
+  t.after(() => ctx._cleanup())
+  const { Store } = await import('../lib/store.mjs')
+  const store = new Store(cfg.dataDir)
+  // 真实场景：feed job 当日故障已通知过 ⇒ 有意静默（调 --skip 记账），不是漏发。
+  const job = makeJob({
+    prompt: '__SKIP__ --key "{{DSH_SCHED_RUN_KEY}}" 当日故障已通知',
+    notify: { channel: 'feishu', require: true },
+  })
+  store.upsertJob(job)
+
+  const done = await waitFor(() => store.listRuns(job.id).find((r) => r.evt === 'finish'))
+  assert.equal(done.status, 'succeeded', '合法静默不得被判失败（否则 require 永远开不起来）')
+  assert.equal(done.push.status, 'skipped')
+  assert.equal(done.push.key, done.runKey)
+  assert.equal(store.getJob(job.id).consecutiveFailures, 0)
+
+  const res = makeRes()
+  routes.get('/plugins/dsh-scheduler/status')({}, res)
+  const body = JSON.parse(res.body)
+  assert.equal(body.counts.pushSkipped, 1)
+  assert.equal(body.counts.pushMissing, 0, 'skipped 不得混进 missing 计数')
+})
+
+test('三态：delivered 优先于 skipped（已真投递的 key 不会被 --skip 覆盖）', async (t) => {
+  const { ctx } = makeCtx()
+  const mod = await import(pluginHref)
+  const cfg = makeCfg()
+  mod.apply(ctx, cfg)
+  t.after(() => ctx._cleanup())
+  const { Store } = await import('../lib/store.mjs')
+  const store = new Store(cfg.dataDir)
+  const job = makeJob({ notify: { channel: 'feishu' } })
+  store.upsertJob(job)
+  // 预置同 key 的 .sent（模拟脚本侧已投递）
+  const key = mod.computeRunKey(job.id, job.nextRunAt)
+  const fs = await import('node:fs')
+  fs.writeFileSync(
+    `${cfg.deliveryStateDir}/${mod.deliveryKeyHash(key)}.sent`,
+    JSON.stringify({ key, messageId: 'om_pre', sentAt: 'T' }),
+  )
+  fs.writeFileSync(
+    `${cfg.deliveryStateDir}/${mod.deliveryKeyHash(key)}.skipped`,
+    JSON.stringify({ key, reason: 'stale' }),
+  )
+
+  const done = await waitFor(() => store.listRuns(job.id).find((r) => r.evt === 'finish'))
+  assert.equal(done.push.status, 'delivered', '.sent 存在时必须优先判 delivered')
 })
 
 test('renderPrompt：占位符全部替换；无占位符或 runKey 为空时原样返回', async () => {

@@ -208,6 +208,31 @@ export function readDeliveryRecord(stateDir, key) {
   }
 }
 
+/**
+ * 读「合法静默」标记（`feishu-push.sh --skip` 写的 `<hash>.skipped`）。
+ *
+ * 为什么需要第三态：prompt 里有**合法的"本次不推送"分支**——例如 feed job 当日
+ * 故障已通知过就静默（避免同日重复打扰）。若只认 `.sent`，那种情况会被记成
+ * missing（漏发），`notify.require` 便永远无法开启（2026-10-03 实测：21:35 那次
+ * run 正确静默，却被记成 delivered=missing）。三态后：delivered=发了；
+ * skipped=有意没发；missing=该发而没发（唯一该判失败的那种）。
+ */
+export function readSkipRecord(stateDir, key) {
+  if (!stateDir || !key) return null
+  try {
+    const raw = readFileSync(join(stateDir, `${deliveryKeyHash(key)}.skipped`), 'utf8')
+    const rec = JSON.parse(raw)
+    return {
+      channel: 'feishu',
+      key,
+      reason: typeof rec.reason === 'string' && rec.reason !== '' ? rec.reason : 'skipped',
+      at: typeof rec.at === 'string' ? rec.at : null,
+    }
+  } catch {
+    return null
+  }
+}
+
 /** Validate local execution prerequisites before spending an attempt. */
 export function preflightExecution(entry, workspace) {
   if (!entry || !Array.isArray(entry.args) || entry.args.length === 0) {
@@ -941,11 +966,15 @@ export function apply(ctx, config) {
         inflight.delete(job.id)
       // 交付事实（2026-10-03 复盘）：job 声明了 notify 才跟踪。必须在判定
       // willRetry 之前算出来，require 门禁才能参与成败判定。
-      // 权威来源是 push 脚本的 .sent（脚本才是发送方），scheduler 只派生。
-      const pushRecord = job.notify ? readDeliveryRecord(cfg.deliveryStateDir, runKey) : null
+      // 权威来源是 push 脚本的状态文件（脚本才是发送方），scheduler 只派生；
+      // 三态：.sent=delivered / .skipped=有意不推送（合法）/ 都没有=missing。
+      const pushSent = job.notify ? readDeliveryRecord(cfg.deliveryStateDir, runKey) : null
+      const pushSkipped = job.notify && !pushSent ? readSkipRecord(cfg.deliveryStateDir, runKey) : null
+      const pushRecord = pushSent ?? pushSkipped
       if (job.notify?.require === true && result.status === 'succeeded' && !pushRecord) {
-        // 交付门禁：脚本层没有该 runKey 的 .sent ⇒ 这次触发没送达。记 failed 且
-        // **允许重试**——重试会再跑一遍 prompt，而 .sent 仍然缺失，所以补发不会被
+        // 交付门禁：脚本层既没有该 runKey 的 .sent 也没有 .skipped ⇒ 这次触发**该发
+        // 而没发**。记 failed 且 **允许重试**——重试会再跑一遍 prompt，而标记仍然
+        // 缺失，所以补发不会被
         // 脚本层当成重复；反过来若已送达，.sent 在，重试也推不出第二条。
         result = {
           ...result,
@@ -981,9 +1010,11 @@ export function apply(ctx, config) {
       // 交付写进台账（与 deliverTo 的 `delivery` 字段区分开：那是"投递到目标
       // 会话"，这里是"推送到渠道"。两条链路的失败模式完全不同，不能共用一个字段）。
       if (job.notify) {
-        finalRun.push = pushRecord
-          ? { status: 'delivered', ...pushRecord }
-          : { status: 'missing', channel: job.notify.channel ?? 'feishu', key: runKey }
+        finalRun.push = pushSent
+          ? { status: 'delivered', ...pushSent }
+          : pushSkipped
+            ? { status: 'skipped', ...pushSkipped }
+            : { status: 'missing', channel: job.notify.channel ?? 'feishu', key: runKey }
         pushState.set(job.id, { ...finalRun.push, runId, at: completedAt })
       }
       // Defer delivery (target-session notification) until the final outcome.
@@ -1451,10 +1482,12 @@ export function apply(ctx, config) {
           enabled: jobs.filter((j) => j.enabled && j.state !== 'paused' && j.state !== 'completed').length,
           inflight: inflight.size,
           failing: jobs.filter((j) => (j.consecutiveFailures ?? 0) > 0).length,
-          // 交付面：跟踪投递的 job 数 / 最近一次投递缺失的 job 数。assertCmd 只看
-          // 报告文件，这是唯一能看出「发了几条」的计数（2026-10-03 复盘）。
+          // 交付面：跟踪投递的 job 数 / 最近一次**该发而没发**的 job 数 / 有意静默的
+          // job 数。assertCmd 只看报告文件，这是唯一能看出「发了几条」的计数
+          // （2026-10-03 复盘）。skipped 是合法状态，不能混进 missing。
           notifyJobs: jobs.filter((j) => j.notify).length,
-          pushMissing: [...pushState.values()].filter((v) => v.status !== 'delivered').length,
+          pushMissing: [...pushState.values()].filter((v) => v.status === 'missing').length,
+          pushSkipped: [...pushState.values()].filter((v) => v.status === 'skipped').length,
         },
         lastError: null,
         detail: {
