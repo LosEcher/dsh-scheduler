@@ -1468,7 +1468,13 @@ export function apply(ctx, config) {
   }
 
   // /plugins/<id>/status 统一约定（2026-08-23）：内部状态只读折叠（exact 独立路由）
-  ctx.webServer.register({
+  // ⚠️ 必须持有 disposer 并在生命周期清理里释放（2026-10-05 实证）：本行原先没有
+  // 释放路径，config-only 重放时旧实例的这条路由残留，新实例注册即抛
+  // "webserver: duplicate exact route \"/plugins/dsh-scheduler/status\""，整次
+  // reapply 被放弃 ⇒ 旧实例的 prefix 路由（/scheduler，GUI tab 与 REST API 都走它）
+  // 已被拆掉、tick 循环已停，而这条 status 路由仍用旧闭包应答（lastTickAt 冻结）
+  // —— 表现为「调度器假活：状态接口 200，但任务永不再触发」。
+  const disposeStatusRoute = ctx.webServer.register({
     kind: 'exact',
     path: '/plugins/dsh-scheduler/status',
     handler: (_req, r) => {
@@ -1561,6 +1567,7 @@ export function apply(ctx, config) {
       clearInterval(tickTimer)
       clearTimeout(wakeTimer)
       server()
+      disposeStatusRoute()
       // Let in-flight headless children exit naturally; the web drain owns the
       // process boundary.
     }
