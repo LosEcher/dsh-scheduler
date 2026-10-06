@@ -971,6 +971,21 @@ export function apply(ctx, config) {
       const pushSent = job.notify ? readDeliveryRecord(cfg.deliveryStateDir, runKey) : null
       const pushSkipped = job.notify && !pushSent ? readSkipRecord(cfg.deliveryStateDir, runKey) : null
       const pushRecord = pushSent ?? pushSkipped
+      // 「交付恰好一次」（2026-10-06）：runKey 就是 jobId|scheduledFor，key 幂等本应让同一
+      // 次触发只可能有一条交付事实。台账里已有同 key 的 delivered 事件却又出现一条 ⇒
+      // 发送方绕开了 key（例如 prompt 里换了自定义 --key），属真重复，必须红且**不重试**
+      // （重试只会再发一次）。
+      if (pushSent) {
+        const prior = store.countDeliveredEvents(runKey, 'delivered')
+        if (prior > 0) {
+          result = {
+            ...result,
+            status: 'failed',
+            deliveryDuplicate: true,
+            error: `delivery duplicated for key "${runKey}"（台账已有 ${prior} 次 delivered）`,
+          }
+        }
+      }
       if (job.notify?.require === true && result.status === 'succeeded' && !pushRecord) {
         // 交付门禁：脚本层既没有该 runKey 的 .sent 也没有 .skipped ⇒ 这次触发**该发
         // 而没发**。记 failed 且 **允许重试**——重试会再跑一遍 prompt，而标记仍然
@@ -991,7 +1006,7 @@ export function apply(ctx, config) {
       // Assert failures are deterministic: retrying would just re-run the same
       // side effects (including any notification already sent) without fixing
       // the condition. They still count toward the failure streak/alert.
-      const willRetry = failed && !result.assertFailed && shouldRetry(job, cfg, result.status, output, attempt)
+      const willRetry = failed && !result.assertFailed && !result.deliveryDuplicate && shouldRetry(job, cfg, result.status, output, attempt)
       const finalRun = {
         ...run,
         ...result,
@@ -1016,6 +1031,21 @@ export function apply(ctx, config) {
             ? { status: 'skipped', ...pushSkipped }
             : { status: 'missing', channel: job.notify.channel ?? 'feishu', key: runKey }
         pushState.set(job.id, { ...finalRun.push, runId, at: completedAt })
+        // 交付事实写成**独立 side 事件**（evt:'delivered'）：台账从此能机械回答
+        // 「这个 runKey 交付了几次」（store.listRuns 折叠时把它当 side event，不参与
+        // 状态折叠；countDeliveredEvents 供恰好一次门禁使用）。只在真有交付事实
+        // （.sent 或 .skipped）时写，missing 不写——missing 由 finish 的 push 字段与
+        // require 门禁表达。
+        if (pushRecord) {
+          store.appendRun({
+            id: runId, jobId: job.id, triggerKind, scheduledFor, attempt,
+            evt: 'delivered',
+            deliveryKey: runKey,
+            deliveryStatus: pushSent ? 'delivered' : 'skipped',
+            channel: job.notify.channel ?? 'feishu',
+            startedAt, completedAt,
+          })
+        }
       }
       // Defer delivery (target-session notification) until the final outcome.
       // NOTE: `delivery` must be function-scoped — the success log below

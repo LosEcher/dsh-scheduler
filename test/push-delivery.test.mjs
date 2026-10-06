@@ -17,7 +17,7 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import { pathToFileURL } from 'node:url'
-import { mkdtempSync, writeFileSync, mkdirSync } from 'node:fs'
+import { mkdtempSync, writeFileSync, mkdirSync, readFileSync } from 'node:fs'
 import { execSync } from 'node:child_process'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
@@ -357,3 +357,97 @@ test('非 notify job 不产生 push 字段（不打扰既有 jobs）', async (t)
   assert.equal(done.status, 'succeeded')
   assert.equal(done.push, undefined, '未声明 notify ⇒ 交付链不参与')
 })
+
+// ── 交付恰好一次（2026-10-06）───────────────────────────────────────────────
+//
+// runKey 已是 jobId|scheduledFor，key 幂等本应让一次触发只可能有一条交付事实。
+// 本次把「交付」写成独立 side 事件（evt:'delivered'）并加恰好一次门禁：台账里同 key
+// 已有 delivered 却又出现一条 ⇒ 发送方绕开了 key，判失败且**不重试**（重试只会再发）。
+
+test('交付事实写成独立 side 事件：不参与状态折叠，pushCount=1', async (t) => {
+  const { ctx } = makeCtx()
+  const mod = await import(pluginHref)
+  const cfg = makeCfg()
+  mod.apply(ctx, cfg)
+  t.after(() => ctx._cleanup())
+  const { Store } = await import('../lib/store.mjs')
+  const store = new Store(cfg.dataDir)
+  const job = makeJob({ prompt: '__PUSH__ --key "{{DSH_SCHED_RUN_KEY}}" --max-chars 500 推一条', notify: { channel: 'feishu' } })
+  store.upsertJob(job)
+
+  const done = await waitFor(() => store.listRuns(job.id).find((r) => r.evt === 'finish'))
+  assert.equal(done.status, 'succeeded', 'delivered 事件不得把 finish 状态吃掉')
+
+  const raw = readFileSync(join(cfg.dataDir, 'runs.jsonl'), 'utf8').split('\n').filter(Boolean).map((l) => JSON.parse(l))
+  const delivered = raw.filter((e) => e.evt === 'delivered')
+  assert.equal(delivered.length, 1, '一次触发恰好一条 delivered 事件')
+  assert.equal(delivered[0].deliveryKey, done.runKey)
+  assert.equal(delivered[0].deliveryStatus, 'delivered')
+  assert.equal(delivered[0].channel, 'feishu')
+  assert.equal(delivered[0].id, done.id, 'delivered 事件挂在同一个 runId 上')
+
+  const folded = store.listRuns(job.id).find((r) => r.id === done.id)
+  assert.equal(folded.status, 'succeeded')
+  assert.equal(folded.pushCount, 1)
+  assert.equal(folded.deliveries.length, 1)
+  assert.equal(folded.deliveries[0].key, done.runKey)
+  assert.equal(store.countDeliveredEvents(done.runKey, 'delivered'), 1)
+})
+
+test('负向控制：同 key 第二条 delivered → 判失败（deliveryDuplicate）且不重试', async (t) => {
+  const { ctx } = makeCtx()
+  const mod = await import(pluginHref)
+  const cfg = makeCfg()
+  const { Store } = await import('../lib/store.mjs')
+  const store = new Store(cfg.dataDir)
+  const job = makeJob({ prompt: '__PUSH__ --key "{{DSH_SCHED_RUN_KEY}}" --max-chars 500 推一条', notify: { channel: 'feishu' } })
+  store.upsertJob(job)
+  // 预置一条同 key 的历史交付（模拟「上次触发已交付、这次又发了一次」）
+  const runKey = mod.computeRunKey(job.id, job.nextRunAt)
+  store.appendRun({
+    id: 'run-seeded', jobId: job.id, evt: 'delivered',
+    deliveryKey: runKey, deliveryStatus: 'delivered', channel: 'feishu',
+    startedAt: nowIsoSeconds(), completedAt: nowIsoSeconds(),
+  })
+  assert.equal(store.countDeliveredEvents(runKey, 'delivered'), 1)
+
+  mod.apply(ctx, cfg)
+  t.after(() => ctx._cleanup())
+
+  const done = await waitFor(() => store.listRuns(job.id).find((r) => r.evt === 'finish'))
+  assert.equal(done.status, 'failed', '同 key 再交付必须红')
+  assert.equal(done.deliveryDuplicate, true)
+  assert.match(done.error ?? '', /duplicated/)
+  // 不重试：one finish 事件即终态（重试会再发一次，正是要防的）
+  await new Promise((r) => setTimeout(r, 1_200))
+  const finishes = store.listRuns(job.id, 50).filter((r) => r.evt === 'finish')
+  assert.equal(finishes.length, 1, '重复交付不得触发重试')
+})
+
+test('反向控制：先 skip 后 delivered 不算重复（合法升级，只数 delivered）', async (t) => {
+  const { ctx } = makeCtx()
+  const mod = await import(pluginHref)
+  const cfg = makeCfg()
+  const { Store } = await import('../lib/store.mjs')
+  const store = new Store(cfg.dataDir)
+  const job = makeJob({ prompt: '__PUSH__ --key "{{DSH_SCHED_RUN_KEY}}" --max-chars 500 推一条', notify: { channel: 'feishu' } })
+  store.upsertJob(job)
+  const runKey = mod.computeRunKey(job.id, job.nextRunAt)
+  store.appendRun({
+    id: 'run-seeded-skip', jobId: job.id, evt: 'delivered',
+    deliveryKey: runKey, deliveryStatus: 'skipped', channel: 'feishu',
+    startedAt: nowIsoSeconds(), completedAt: nowIsoSeconds(),
+  })
+  assert.equal(store.countDeliveredEvents(runKey, 'delivered'), 0, 'skipped 不计入 delivered')
+
+  mod.apply(ctx, cfg)
+  t.after(() => ctx._cleanup())
+
+  const done = await waitFor(() => store.listRuns(job.id).find((r) => r.evt === 'finish'))
+  assert.equal(done.status, 'succeeded')
+  assert.equal(done.deliveryDuplicate, undefined)
+})
+
+function nowIsoSeconds() {
+  return new Date().toISOString()
+}
