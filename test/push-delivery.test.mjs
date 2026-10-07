@@ -394,7 +394,7 @@ test('交付事实写成独立 side 事件：不参与状态折叠，pushCount=1
   assert.equal(store.countDeliveredEvents(done.runKey, 'delivered'), 1)
 })
 
-test('负向控制：同 key 第二条 delivered → 判失败（deliveryDuplicate）且不重试', async (t) => {
+test('负向控制：同键出现**不同** messageId（=真的发了两条）→ 判失败（deliveryDuplicate）且不重试', async (t) => {
   const { ctx } = makeCtx()
   const mod = await import(pluginHref)
   const cfg = makeCfg()
@@ -402,11 +402,14 @@ test('负向控制：同 key 第二条 delivered → 判失败（deliveryDuplica
   const store = new Store(cfg.dataDir)
   const job = makeJob({ prompt: '__PUSH__ --key "{{DSH_SCHED_RUN_KEY}}" --max-chars 500 推一条', notify: { channel: 'feishu' } })
   store.upsertJob(job)
-  // 预置一条同 key 的历史交付（模拟「上次触发已交付、这次又发了一次」）
+  // 预置一条同键的历史交付，且带**另一个** messageId —— 这正是"同一个键真的发出去两条"的
+  // 可观测特征（2026-10-07 起判重按"不同 messageId 数"而不是按 delivered 事件条数：
+  // 事件域交付键下，同一次真实事件的多次触发会各写一条事件、却只有一次真发送）。
   const runKey = mod.computeRunKey(job.id, job.nextRunAt)
   store.appendRun({
     id: 'run-seeded', jobId: job.id, evt: 'delivered',
     deliveryKey: runKey, deliveryStatus: 'delivered', channel: 'feishu',
+    messageId: 'om_seeded_previous_send',
     startedAt: nowIsoSeconds(), completedAt: nowIsoSeconds(),
   })
   assert.equal(store.countDeliveredEvents(runKey, 'delivered'), 1)
@@ -451,3 +454,58 @@ test('反向控制：先 skip 后 delivered 不算重复（合法升级，只数
 function nowIsoSeconds() {
   return new Date().toISOString()
 }
+
+// ── 交付键（事件域幂等键，2026-10-07）──────────────────────────────────────
+// 背景：runKey = jobId|scheduledFor 是**槽位域**键 ⇒ 同一次真实事件被额外触发时
+// scheduledFor 变了、键也变，两条都推得出去（feed 10-02/10-03/10-06 三起重复；
+// 周更作业 10-06 09:09-09:14 连推 3 条）。deliveryKey 模板把键抬到**事件域**。
+test('computeDeliveryKey: 未配模板 ⇒ 严格等于 runKey（旧 job 零影响）', async () => {
+  const mod = await import(pluginHref)
+  const job = { id: 'job-x' }
+  assert.equal(mod.computeDeliveryKey(job, 'job-x|2026-10-06T05:35:00.000Z', '2026-10-06T05:35:00.000Z'), 'job-x|2026-10-06T05:35:00.000Z')
+})
+
+test('computeDeliveryKey: 同一小时内两次不同触发 ⇒ 同一个交付键（这就是修复点）', async () => {
+  const mod = await import(pluginHref)
+  const job = { id: 'job-feed', deliveryKey: 'feed-digest-{{jobId}}-{{date}}-{{hour}}' }
+  const at = new Date(2026, 9, 6, 13, 40, 0)   // 本地 2026-10-06 13:40
+  const a = mod.computeDeliveryKey(job, 'job-feed|2026-10-06T05:35:00.000Z', '2026-10-06T05:35:00.000Z', at)
+  const b = mod.computeDeliveryKey(job, 'job-feed|2026-10-06T05:37:00.000Z', '2026-10-06T05:37:00.000Z', at)
+  assert.equal(a, b, 'cron 槽与额外触发必须算出同一个交付键')
+  assert.equal(a, 'feed-digest-job-feed-20261006-13')
+})
+
+test('computeDeliveryKey: 不同小时/不同日 ⇒ 不同键（不能过度合并）', async () => {
+  const mod = await import(pluginHref)
+  const job = { id: 'job-feed', deliveryKey: 'feed-digest-{{jobId}}-{{date}}-{{hour}}' }
+  const h13 = mod.computeDeliveryKey(job, 'r', 'r', new Date(2026, 9, 6, 13, 1, 0))
+  const h21 = mod.computeDeliveryKey(job, 'r', 'r', new Date(2026, 9, 6, 21, 1, 0))
+  const nextDay = mod.computeDeliveryKey(job, 'r', 'r', new Date(2026, 9, 7, 13, 1, 0))
+  assert.notEqual(h13, h21, '同日不同槽必须是不同键')
+  assert.notEqual(h13, nextDay, '跨日必须是不同键')
+})
+
+test('renderPrompt: 两个占位符都替换；未配 deliveryKey 时不留字面量占位符为"假键"', async () => {
+  const mod = await import(pluginHref)
+  const p = 'push --key "{{DSH_SCHED_RUN_KEY}}" and "{{DSH_SCHED_DELIVERY_KEY}}"'
+  assert.equal(mod.renderPrompt(p, 'RUN', 'DEL'), 'push --key "RUN" and "DEL"')
+  // 未配 deliveryKey（=undefined）：占位符原样保留（宁可让 job 报错，也不让所有 job 共用假键）
+  assert.equal(mod.renderPrompt(p, 'RUN', undefined), 'push --key "RUN" and "{{DSH_SCHED_DELIVERY_KEY}}"')
+  // 旧行为：只给 runKey 时与改动前一致
+  assert.equal(mod.renderPrompt('x {{DSH_SCHED_RUN_KEY}}', 'RUN'), 'x RUN')
+})
+
+
+// ── deliveredMessageIds（2026-10-07，事件域交付键的配套判据）─────────────────────
+test('deliveredMessageIds：同键同 messageId 去重为 1；不同 messageId 为 2；缺 messageId 不计', async () => {
+  const { Store } = await import('../lib/store.mjs')
+  const store = new Store(mkdtempSync(join(tmpdir(), 'sched-msgids-')))
+  const key = 'feed-digest-job-x-20261006-13'
+  for (const mid of ['om_a', 'om_a', 'om_b']) {
+    store.appendRun({ id: 'r', jobId: 'job-x', evt: 'delivered', deliveryKey: key, deliveryStatus: 'delivered', messageId: mid, startedAt: nowIsoSeconds(), completedAt: nowIsoSeconds() })
+  }
+  assert.deepEqual(store.deliveredMessageIds(key).sort(), ['om_a', 'om_b'])
+  store.appendRun({ id: 'r2', jobId: 'job-x', evt: 'delivered', deliveryKey: key, deliveryStatus: 'delivered', startedAt: nowIsoSeconds(), completedAt: nowIsoSeconds() })
+  assert.equal(store.deliveredMessageIds(key).length, 2, '缺 messageId 的旧事件不计入')
+  assert.equal(store.deliveredMessageIds('no-such-key').length, 0)
+})

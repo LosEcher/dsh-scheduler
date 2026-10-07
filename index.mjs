@@ -166,10 +166,17 @@ export const RUN_KEY_PLACEHOLDER = '{{DSH_SCHED_RUN_KEY}}'
  * 无可替换内容时**原样返回**（旧 job 不受影响）；runKey 为空时也原样返回，
  * 绝不把占位符留成字面量——否则所有 job 会共用同一个假 key，互相 dedup 掉。
  */
-export function renderPrompt(prompt, runKey) {
-  const text = String(prompt ?? '')
-  if (!runKey || !text.includes(RUN_KEY_PLACEHOLDER)) return text
-  return text.split(RUN_KEY_PLACEHOLDER).join(runKey)
+export const DELIVERY_KEY_PLACEHOLDER = '{{DSH_SCHED_DELIVERY_KEY}}'
+
+export function renderPrompt(prompt, runKey, deliveryKey) {
+  let text = String(prompt ?? '')
+  if (runKey && text.includes(RUN_KEY_PLACEHOLDER)) text = text.split(RUN_KEY_PLACEHOLDER).join(runKey)
+  // 交付键占位符：job 配了 deliveryKey 模板时才有值；没配就**原样保留**
+  // （与 runKey 同一条理由：绝不把占位符留成字面量，否则所有 job 共用一个假 key 互相 dedup）。
+  if (deliveryKey && text.includes(DELIVERY_KEY_PLACEHOLDER)) {
+    text = text.split(DELIVERY_KEY_PLACEHOLDER).join(deliveryKey)
+  }
+  return text
 }
 
 /**
@@ -180,6 +187,38 @@ export function renderPrompt(prompt, runKey) {
  */
 export function computeRunKey(jobId, scheduledFor) {
   return `${jobId}|${scheduledFor}`
+}
+
+/**
+ * 交付键（幂等键）——**事件域**，默认等于 runKey（槽位域）。
+ *
+ * 为什么需要它（2026-10-07 用 .sent 台账定位到根因）：runKey = `jobId|scheduledFor` 是
+ * **槽位域**键。同一次真实事件被额外触发时 `scheduledFor` 会变（手动触发、补跑），键就变了，
+ * 于是两条都推得出去；实测三起重复全是这个机制：
+ *   - feed 作业 2026-10-06 同时出现 `…|05:35:00.000Z` 与 `…|05:37:00.000Z`（cron 槽 + 额外触发）；
+ *   - 周更作业 2026-10-06 09:09–09:14 被触发 3 次 ⇒ 连推 3 条（三个 ad-hoc scheduledFor）。
+ * 结论：**「每键一次」≠「每事件一次」**。给 job 配一个事件域模板即可对齐：
+ *   `deliveryKey: 'feed-digest-{{jobId}}-{{date}}-{{hour}}'`
+ * 占位符：{{jobId}} {{runKey}} {{scheduledFor}} {{date}}(本地 YYYYMMDD) {{hour}}(本地 HH) {{slot}}(本地 HHMM)。
+ * 未配 deliveryKey ⇒ 返回 runKey，**行为与改动前逐位一致**（旧 job 零影响）。
+ */
+export function computeDeliveryKey(job, runKey, scheduledFor, now = new Date()) {
+  const template = job && typeof job.deliveryKey === 'string' ? job.deliveryKey.trim() : ''
+  if (!template) return runKey
+  const pad = (n) => String(n).padStart(2, '0')
+  const d = now instanceof Date && !Number.isNaN(now.getTime()) ? now : new Date()
+  const local = {
+    date: `${d.getFullYear()}${pad(d.getMonth() + 1)}${pad(d.getDate())}`,
+    hour: pad(d.getHours()),
+    slot: `${pad(d.getHours())}${pad(d.getMinutes())}`,
+  }
+  return template
+    .split('{{jobId}}').join(String(job?.id ?? ''))
+    .split('{{runKey}}').join(String(runKey ?? ''))
+    .split('{{scheduledFor}}').join(String(scheduledFor ?? ''))
+    .split('{{date}}').join(local.date)
+    .split('{{hour}}').join(local.hour)
+    .split('{{slot}}').join(local.slot)
 }
 
 /** 与 feishu-push.sh 的 key_hash 逐位对齐：sha256(key) 的 hex 前 16 位。 */
@@ -543,6 +582,17 @@ export function normalizeJob(input, existing) {
   //   presence = 跟踪（把 .sent 派生成台账里的 push 字段 + status 路由可见）
   //   require: true = 交付缺失即判本次运行失败并可重试（默认关：先观测遵守率，
   //   避免"模型没按 key 调用"把机制本身变成重复推送源）。null 清除。
+  // deliveryKey: 交付/幂等键模板（事件域）。未配 = 用 runKey（槽位域，旧行为）。
+  // 见 computeDeliveryKey 的长注释：这是"一次真实事件只推一条"的关键。
+  let deliveryKey = existing?.deliveryKey
+  if (input.deliveryKey !== undefined) {
+    if (input.deliveryKey === null) {
+      deliveryKey = undefined
+    } else {
+      const text = String(input.deliveryKey).trim().slice(0, 200)
+      deliveryKey = text === '' ? undefined : text
+    }
+  }
   let notify = existing?.notify
   if (input.notify !== undefined) {
     if (input.notify === null) {
@@ -563,6 +613,7 @@ export function normalizeJob(input, existing) {
     ...(model ? { model } : {}),
     ...(assertCmd ? { assertCmd } : {}),
     ...(notify ? { notify } : {}),
+    ...(deliveryKey ? { deliveryKey } : {}),
   }
 }
 
@@ -767,17 +818,21 @@ export function apply(ctx, config) {
     // attempt 共用一个 key**，重试/自我纠正都推不出第二条（脚本层 claim→send→commit）。
     // 同时把 runKey 写进 start/finish 台账，交付事实可按 key 反查。
     const runKey = computeRunKey(job.id, scheduledFor)
+    // 交付键：默认 = runKey（槽位域，旧行为）；job 配了 deliveryKey 模板则用事件域键
+    // （手动/补跑触发同一事件时键不变 ⇒ 幂等成立）。见 computeDeliveryKey 的长注释。
+    const deliveryKey = computeDeliveryKey(job, runKey, scheduledFor)
     const runEnv = {
       ...process.env,
       DSH_SCHED_JOB_ID: job.id,
       DSH_SCHED_RUN_KEY: runKey,
+      DSH_SCHED_DELIVERY_KEY: deliveryKey,
       DSH_SCHED_SCHEDULED_FOR: String(scheduledFor ?? ''),
       DSH_SCHED_ATTEMPT: String(attempt),
       DSH_SCHED_DELIVERY_STATE_DIR: cfg.deliveryStateDir,
     }
     const run = {
       id: runId, jobId: job.id, triggerKind, scheduledFor, attempt, evt: 'start', status: 'running', startedAt,
-      runKey,
+      runKey, deliveryKey,
       ...(dispatchLatencyMs !== undefined && attempt === 1 ? { dispatchLatencyMs } : {}),
     }
     store.appendRun(run)
@@ -855,7 +910,7 @@ export function apply(ctx, config) {
     const child = spawn(process.execPath, [
       ...defaultEntry.args, '--profile', 'headless',
       ...(modelOverride ? ['--patch', modelOverride.patchPath] : []),
-      renderPrompt(job.prompt, runKey),
+      renderPrompt(job.prompt, runKey, deliveryKey),
     ], {
       cwd: workspace,
       env: runEnv,
@@ -968,21 +1023,26 @@ export function apply(ctx, config) {
       // willRetry 之前算出来，require 门禁才能参与成败判定。
       // 权威来源是 push 脚本的状态文件（脚本才是发送方），scheduler 只派生；
       // 三态：.sent=delivered / .skipped=有意不推送（合法）/ 都没有=missing。
-      const pushSent = job.notify ? readDeliveryRecord(cfg.deliveryStateDir, runKey) : null
-      const pushSkipped = job.notify && !pushSent ? readSkipRecord(cfg.deliveryStateDir, runKey) : null
+      const pushSent = job.notify ? readDeliveryRecord(cfg.deliveryStateDir, deliveryKey) : null
+      const pushSkipped = job.notify && !pushSent ? readSkipRecord(cfg.deliveryStateDir, deliveryKey) : null
       const pushRecord = pushSent ?? pushSkipped
       // 「交付恰好一次」（2026-10-06）：runKey 就是 jobId|scheduledFor，key 幂等本应让同一
       // 次触发只可能有一条交付事实。台账里已有同 key 的 delivered 事件却又出现一条 ⇒
       // 发送方绕开了 key（例如 prompt 里换了自定义 --key），属真重复，必须红且**不重试**
       // （重试只会再发一次）。
       if (pushSent) {
-        const prior = store.countDeliveredEvents(runKey, 'delivered')
-        if (prior > 0) {
+        // 事件域交付键下，同一次真实事件的多次触发都会看到同一个 .sent 并各写一条 delivered
+        // 事件 ⇒ **按条数判会误判**。真正的重复 = 同一个键真的发出去两条，其特征是 .sent 的
+        // messageId 变了（脚本 dedup 时不重写 .sent；只有绕过 key/--force 才变）。
+        const priorIds = store.deliveredMessageIds(deliveryKey)
+        const distinct = new Set(priorIds)
+        if (pushSent.messageId) distinct.add(pushSent.messageId)
+        if (distinct.size > 1) {
           result = {
             ...result,
             status: 'failed',
             deliveryDuplicate: true,
-            error: `delivery duplicated for key "${runKey}"（台账已有 ${prior} 次 delivered）`,
+            error: `delivery duplicated for key "${deliveryKey}"（该键出现过 ${distinct.size} 个不同 messageId；runKey=${runKey}）`,
           }
         }
       }
@@ -995,7 +1055,7 @@ export function apply(ctx, config) {
           ...result,
           status: 'failed',
           deliveryMissing: true,
-          error: `delivery missing for key "${runKey}"（在 ${cfg.deliveryStateDir} 找不到 .sent）`,
+          error: `delivery missing for key "${deliveryKey}"（在 ${cfg.deliveryStateDir} 找不到 .sent；runKey=${runKey}）`,
         }
       }
       const completedAt = nowIso()
@@ -1029,7 +1089,7 @@ export function apply(ctx, config) {
           ? { status: 'delivered', ...pushSent }
           : pushSkipped
             ? { status: 'skipped', ...pushSkipped }
-            : { status: 'missing', channel: job.notify.channel ?? 'feishu', key: runKey }
+            : { status: 'missing', channel: job.notify.channel ?? 'feishu', key: deliveryKey }
         pushState.set(job.id, { ...finalRun.push, runId, at: completedAt })
         // 交付事实写成**独立 side 事件**（evt:'delivered'）：台账从此能机械回答
         // 「这个 runKey 交付了几次」（store.listRuns 折叠时把它当 side event，不参与
@@ -1040,8 +1100,10 @@ export function apply(ctx, config) {
           store.appendRun({
             id: runId, jobId: job.id, triggerKind, scheduledFor, attempt,
             evt: 'delivered',
-            deliveryKey: runKey,
+            deliveryKey,
             deliveryStatus: pushSent ? 'delivered' : 'skipped',
+            // messageId 是"这个键到底发出去几条"的可观测特征（脚本 dedup 时不重写 .sent）
+            ...(pushSent?.messageId ? { messageId: pushSent.messageId } : {}),
             channel: job.notify.channel ?? 'feishu',
             startedAt, completedAt,
           })

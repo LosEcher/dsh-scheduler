@@ -95,6 +95,45 @@ DSH 的定时任务（cron / interval / once）插件：宿主半包负责**持�
 > 生效前提：host 插件无 HMR，本改动需**重载 dsh web** 才生效；prompt 侧已用
 > `${DSH_SCHED_RUN_KEY:-<旧 key>}` 做过过渡（重载前回落旧行为，重载后自动升级为 runKey）。
 
+### 0.5.3 交付键模板：把幂等键从"槽位域"抬到"事件域"（2026-10-07）
+
+**背景（用 `.sent` 台账定位到根因，不是猜）**：`runKey = jobId|scheduledFor` 是**槽位域**键。
+同一次真实事件被额外触发时 `scheduledFor` 会变 ⇒ 键也变 ⇒ 两条都推得出去。实测三起重复全是这个机制：
+
+| 观测 | 台账里的两条 key |
+|---|---|
+| feed 摘要 10-06 相隔 105s | `job-63261034-cd7\|2026-10-06T05:35:00Z` 与 `…\|2026-10-06T05:37:00Z`（cron 槽 + 额外触发） |
+| 周更新 10-06 09:09–09:14 连推 3 条 | `job-ce5b5c94-2c0\|09:09:18.661Z` / `…09:10:41.132Z` / `…09:14:34.462Z`（三次 ad-hoc） |
+
+**结论**：`台账侧「每键恰好一次」` 是绿的，飞书侧聚类是红的 —— **「每键一次」≠「每事件一次」**。
+
+**新增可选字段 `deliveryKey`（模板）**：
+
+```yaml
+- id: my-digest-job
+  deliveryKey: 'feed-digest-{{jobId}}-{{date}}-{{hour}}'   # 事件域键
+  notify: { channel: feishu, require: true }
+```
+
+- 占位符：`{{jobId}}` `{{runKey}}` `{{scheduledFor}}` `{{date}}`(本地 YYYYMMDD) `{{hour}}`(本地 HH) `{{slot}}`(本地 HHMM)
+- prompt 里用 **`{{DSH_SCHED_DELIVERY_KEY}}`** 作 `feishu-push.sh --key`（`{{DSH_SCHED_RUN_KEY}}` 仍然可用，语义不变）
+- assertCmd 里可用 **`$DSH_SCHED_DELIVERY_KEY`**（env 注入，与 `$DSH_SCHED_RUN_KEY` 并列）
+- **未配 `deliveryKey` ⇒ 交付键 = runKey，行为与改动前逐位一致**（旧 job 零影响）
+- 交付派生（`.sent`/`.skipped`）、`notify.require` 门禁、"恰好一次"判据**全部改用交付键** ⇒ 三者自洽
+
+**判据也随之精确化（否则会出现假阳性）**：交付键改成事件域后，同一次真实事件的多次触发都会看到同一个
+`.sent` 并各写一条 `delivered` 事件 ⇒ 若仍按"事件条数"判重复就会误判。现在按 **`messageId` 去重**判：
+`.sent` 的 messageId 变了才是真发了两条（脚本 dedup 时不重写 `.sent`；只有绕过 key / `--force` 才变）。
+`delivered` 事件因此带上 `messageId`；旧台账（无该字段）不计入。
+
+**实测（2026-10-07，临时作业 + `--skip` 保证不发真消息）**：
+两次触发 ⇒ **两个不同 runKey、同一个交付键**、两条 finish 都 `succeeded`、无 `missing`/`duplicate`、
+该键**只有 1 个记账文件**。
+
+**坑（写作业时注意）**：临时用 `workspace=/tmp` 会让 headless 的 workspace-write 沙箱**拒绝执行**
+工作区外的 `~/.dsh/scripts/feishu-push.sh`（表现为 `ledger_write_failed` ⇒ `deliveryMissing` 假红）。
+推送型作业的 workspace 用 `~/.dsh/scheduler-reports`（与既有 7 个作业一致）。
+
 ## 一、调研结论：为什么需要这个插件
 
 ### 1.1 DSH 现状（2026-08-15 核查）
