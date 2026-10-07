@@ -1150,6 +1150,46 @@ export function apply(ctx, config) {
    * spawns bash, never awaits, never throws. The script path is configurable
    * through env DSH_SCHEDULER_ALERT_SCRIPT for test/override.
    */
+  // ── 告警文案（2026-10-07 按「消息文案契约」重写）──────────────────────────
+  // 见 FEISHU-MESSAGE-COPY-REVIEW-2026-10-07.md §2.1。旧版把 job id、attempt、
+  // 原始 error（含 delivery key 与 .sent 绝对路径）、以及**最后 300 字的模型输出**
+  // （实测是一整段英文自述推理）一起塞进 500 字上限，末尾被截断，且完全没有
+  // 「要不要动手」。新契约：第 1 行结论 → 2..4 行证据 → 动作行。
+  // 每条 = [匹配, 人话原因, 重试能否自愈]。第三项决定动作行 —— 说「不会自愈」
+  // 却写「会自动重试」是自相矛盾的（2026-10-07 复算时抓到）。
+  const ALERT_ERROR_HINTS = [
+    [/delivery missing/i, '推送之后没留下投递记录，调度器据此判定「没发出去」', true],
+    [/ERR_MODULE_NOT_FOUND|Cannot find package/i, '运行环境缺依赖（重试不会自愈）', false],
+    [/not supported|unavailable|AUTH: 40[13]/i, '模型不可用（重试不会自愈）', false],
+    [/timed? ?out|ETIMEDOUT|timeout of/i, '执行超时', true],
+    [/assert|missing or empty/i, '报告校验没通过', true],
+    [/DEVICE_OFFLINE/i, '采集设备离线', true],
+  ]
+  function humanizeRunError(error) {
+    const raw = String(error ?? '').trim()
+    if (!raw) return { reason: null, selfHealing: true }
+    for (const [re, text, selfHealing] of ALERT_ERROR_HINTS) {
+      if (re.test(raw)) return { reason: text, selfHealing }
+    }
+    // 兜底：抹掉引号里的长内部键（delivery key / .sent 路径），只留第一句
+    return {
+      reason: raw.replace(/"[^"]{16,}"/g, '…').replace(/（在 [^）]*）/g, '').split(/[;；]/)[0].slice(0, 80),
+      selfHealing: true,
+    }
+  }
+  /** job 名字常带时间表（「…（微博+X → Win，每日 08:35/13:35/21:35）」）：
+   *  告警头行不需要它，而它一占就是三四十字。 */
+  function jobShortName(name) {
+    return String(name ?? '').replace(/[（(][^）)]*[）)]\s*$/, '').trim() || String(name ?? '')
+  }
+  function fmtLocalTime(iso) {
+    if (!iso) return null
+    const d = new Date(iso)
+    if (Number.isNaN(d.getTime())) return null
+    const p = (n) => String(n).padStart(2, '0')
+    return `${p(d.getMonth() + 1)}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}`
+  }
+
   function pushFailureAlert(job, updated, run, attempt, maxAttempts) {
     const script = process.env.DSH_SCHEDULER_ALERT_SCRIPT
       ?? `${homedir()}/.dsh/scripts/feishu-push.sh`
@@ -1157,13 +1197,20 @@ export function apply(ctx, config) {
       ctx.logger.warn(`[dsh-scheduler] failure alert skipped: ${script} not found`)
       return
     }
-    const head = String(run.outputHead ?? '').slice(0, 300).replace(/\n/g, ' ').replace(/\s+/g, ' ')
+    // 去掉旧版的 `- 输出: <模型输出尾部 300 字>`：那是**推理过程**不是结论，实测带进
+    // 整段英文（"So sandbox blocked the tmp write. … which is the desired behavior."，
+    // 见 COPY-REVIEW §2.1 C4）。原文仍可在 runs.jsonl / 报告里查。
+    // job id / attempt 明细 / delivery key / .sent 路径同样降级到台账。
+    const gaveUp = attempt >= maxAttempts
+    const when = fmtLocalTime(run.scheduledFor ?? run.startedAt)
+    const { reason, selfHealing } = humanizeRunError(run.error)
     const text = [
-      `【dsh-scheduler 告警】定时任务「${job.name}」连续失败 ${updated.consecutiveFailures} 次`,
-      `- job: ${job.id}`,
-      `- 状态: ${run.status}（attempt ${attempt}/${maxAttempts}）`,
-      run.error ? `- 错误: ${String(run.error).slice(0, 200)}` : null,
-      head ? `- 输出: ${head}` : null,
+      `🔴 定时任务连败：${jobShortName(job.name)}（${updated.consecutiveFailures} 次）`,
+      `· 最近一次${when ? ` ${when}` : ''}，`
+        + (gaveUp ? `重试 ${attempt}/${maxAttempts} 次已用尽` : `第 ${attempt}/${maxAttempts} 次尝试`),
+      reason ? `· 原因：${reason}` : null,
+      !selfHealing ? '→ 重试不会自愈，需要看一眼'
+        : (gaveUp ? '→ 本次不再重试，需要看一眼' : '→ 无需动手，会自动重试'),
     ].filter(Boolean).join('\n')
     // 告警也走幂等键：key 含 job + 触发时刻 + 失败链长度。同一次触发的告警
     // 只发一条（水位已挡重发，这里再挡一层"重启/重试窗口内水位未落盘"的重复；
