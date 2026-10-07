@@ -17,7 +17,7 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import { pathToFileURL } from 'node:url'
-import { mkdtempSync, writeFileSync, mkdirSync, readFileSync } from 'node:fs'
+import { mkdtempSync, writeFileSync, mkdirSync, readFileSync, utimesSync } from 'node:fs'
 import { execSync } from 'node:child_process'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
@@ -508,4 +508,41 @@ test('deliveredMessageIds：同键同 messageId 去重为 1；不同 messageId �
   store.appendRun({ id: 'r2', jobId: 'job-x', evt: 'delivered', deliveryKey: key, deliveryStatus: 'delivered', startedAt: nowIsoSeconds(), completedAt: nowIsoSeconds() })
   assert.equal(store.deliveredMessageIds(key).length, 2, '缺 messageId 的旧事件不计入')
   assert.equal(store.deliveredMessageIds('no-such-key').length, 0)
+})
+
+// ── 交付越界检测（2026-10-07）──────────────────────────────────────────────
+// 实测事故：feed 作业 21:35 槽 attempt 1 的 agent **自造 key**（feed-<日期>-<HHMM>），
+// 于是同一次触发真发了两条；按 run key 的交付检查只看到 missing。此判据把"越界"当次即红。
+test('findStrayDeliveries：本次 run 期间写入的非交付键被抓出来；同键/旧文件不算；坏文件不抛', async () => {
+  const mod = await import(pluginHref)
+  const dir = mkdtempSync(join(tmpdir(), 'sched-stray-'))
+  const good = mod.computeDeliveryKey({ id: 'j', deliveryKey: 'evt-{{date}}' }, 'r', 'r', new Date())
+  const since = Date.now() - 1000
+
+  // 同键：不算越界
+  writeFileSync(join(dir, 'a.sent'), JSON.stringify({ key: good, messageId: 'om_1', sentAt: new Date().toISOString() }))
+  assert.deepEqual(mod.findStrayDeliveries(dir, good, since), [])
+
+  // 非交付键（agent 自造）：必须抓出来
+  writeFileSync(join(dir, 'b.sent'), JSON.stringify({ key: 'feed-20261007-2136', messageId: 'om_2', sentAt: new Date().toISOString() }))
+  assert.deepEqual(mod.findStrayDeliveries(dir, good, since), ['feed-20261007-2136'])
+
+  // .skipped 同样算
+  writeFileSync(join(dir, 'c.skipped'), JSON.stringify({ key: 'feed-fault-20261007', reason: 'x', at: new Date().toISOString() }))
+  assert.equal(mod.findStrayDeliveries(dir, good, since).length, 2)
+
+  // 旧文件（本次 run 之前）：不算
+  const oldFile = join(dir, 'd.sent')
+  writeFileSync(oldFile, JSON.stringify({ key: 'stale-key', messageId: 'om_3', sentAt: '2020-01-01T00:00:00Z' }))
+  const old = new Date('2020-01-01T00:00:00Z')
+  utimesSync(oldFile, old, old)
+  assert.deepEqual(mod.findStrayDeliveries(dir, good, since).filter((k) => k === 'stale-key'), [])
+
+  // 坏文件：跳过不抛
+  writeFileSync(join(dir, 'e.sent'), '{ not json')
+  assert.ok(Array.isArray(mod.findStrayDeliveries(dir, good, since)))
+
+  // 不存在的目录 / 参数缺失
+  assert.deepEqual(mod.findStrayDeliveries(join(dir, 'nope'), good, since), [])
+  assert.deepEqual(mod.findStrayDeliveries(dir, '', since), [])
 })

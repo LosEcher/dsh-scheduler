@@ -24,7 +24,7 @@ import Schema from '@deepseek-ai/schemastery'
 import { createUserMessage } from '@deepseek-ai/dsh-llm'
 import { spawn } from 'node:child_process'
 import { createHash } from 'node:crypto'
-import { existsSync, mkdirSync, readFileSync, readdirSync, rmSync, unlinkSync, writeFileSync } from 'node:fs'
+import { existsSync, mkdirSync, readFileSync, readdirSync, rmSync, statSync, unlinkSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { homedir } from 'node:os'
 import { Store, newId, nowIso } from './lib/store.mjs'
@@ -219,6 +219,36 @@ export function computeDeliveryKey(job, runKey, scheduledFor, now = new Date()) 
     .split('{{date}}').join(local.date)
     .split('{{hour}}').join(local.hour)
     .split('{{slot}}').join(local.slot)
+}
+
+/**
+ * 交付越界检测（2026-10-07）：本次 run 期间，交付目录里出现了**不是交付键**的 .sent/.skipped。
+ *
+ * 为什么需要（实测踩到）：feed 作业 2026-10-07 21:35 槽的 attempt 1，agent **自造了 key**
+ * （`feed-<日期>-<HHMM>`）而不是用注入的键 —— 于是同一次触发真的推了两条；而按 run key 的交付检查
+ * 只看到 `missing`（它照实报了"该发而没发"），系统无法察觉**另一条已经用别的键发出去了**。
+ * 投递审计的"飞书侧聚类"能事后发现，但那要等一周；这一条把它变成**当次即红**。
+ *
+ * 判据：文件 mtime ≥ run 开始时间（留 2s 余量）且文件里的 key ≠ 交付键 ⇒ 越界。
+ * 记账内容自带 `key` 字段（.sent/.skipped 都是 JSON），所以不必反解 hash。
+ */
+export function findStrayDeliveries(stateDir, deliveryKey, sinceMs) {
+  if (!stateDir || !deliveryKey || !Number.isFinite(sinceMs)) return []
+  const strays = []
+  let names = []
+  try { names = readdirSync(stateDir) } catch { return [] }
+  for (const name of names) {
+    if (!name.endsWith('.sent') && !name.endsWith('.skipped')) continue
+    const full = join(stateDir, name)
+    try {
+      const st = statSync(full)
+      if (st.mtimeMs < sinceMs - 2000) continue          // 本次 run 之前写的，不算
+      const rec = JSON.parse(readFileSync(full, 'utf8'))
+      const key = typeof rec?.key === 'string' ? rec.key : null
+      if (key && key !== deliveryKey) strays.push(key)
+    } catch { /* 半写/损坏：跳过 */ }
+  }
+  return strays
 }
 
 /** 与 feishu-push.sh 的 key_hash 逐位对齐：sha256(key) 的 hex 前 16 位。 */
@@ -1043,6 +1073,20 @@ export function apply(ctx, config) {
             status: 'failed',
             deliveryDuplicate: true,
             error: `delivery duplicated for key "${deliveryKey}"（该键出现过 ${distinct.size} 个不同 messageId；runKey=${runKey}）`,
+          }
+        }
+      }
+      // 交付越界：本次 run 写了别的键 ⇒ agent 自造 key，**当次即红且不重试**
+      // （重试只会再发一条；已发出的那条只能靠事后清理与审计聚类追踪）。
+      if (job.notify) {
+        const sinceMs = Number.isFinite(Date.parse(startedAt)) ? Date.parse(startedAt) : Date.now()
+        const strays = findStrayDeliveries(cfg.deliveryStateDir, deliveryKey, sinceMs)
+        if (strays.length > 0) {
+          result = {
+            ...result,
+            status: 'failed',
+            deliveryStray: true,
+            error: `delivery stray keys during this run: ${strays.join(', ')}（交付键应为 ${deliveryKey}；agent 自造 key 会导致一次触发多条推送）`,
           }
         }
       }
