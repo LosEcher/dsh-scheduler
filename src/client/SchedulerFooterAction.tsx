@@ -12,7 +12,7 @@
 import { useEffect, useState } from 'react'
 import type { PropsLocale, PropsRuntime } from '@deepseek-ai/dsh-client-ui-slots'
 import type {} from '@deepseek-ai/dsh-client-ui-sidebar/client'
-import { IconQueueOutline14, Modal } from '@deepseek-ai/dsh-client-ui-primitives'
+import { IconQueueOutlineRegular, Modal } from '@deepseek-ai/dsh-client-ui-primitives'
 import { SchedulerTabView } from './SchedulerTabView.tsx'
 import { NS } from './locales.ts'
 import css from './SchedulerFooterAction.module.css'
@@ -68,7 +68,7 @@ export function SchedulerFooterAction({ wide, t }: SchedulerFooterActionProps) {
         aria-expanded={open}
         onClick={() => setOpen((value) => !value)}
       >
-        {wide ? <IconQueueOutline14 size={16} /> : <IconQueueOutline14 size={18} />}
+        {wide ? <IconQueueOutlineRegular size={16} /> : <IconQueueOutlineRegular size={18} />}
         {wide && <span className={css.label}>{t('tabTitle')}</span>}
         {inflight > 0 && <span className={css.badge}>{inflight}</span>}
       </button>

@@ -20,7 +20,7 @@
 
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import type { PropsLocale } from '@deepseek-ai/dsh-client-ui-slots'
-import { Button, IconTrashOutline16, Modal } from '@deepseek-ai/dsh-client-ui-primitives'
+import { Button, IconTrashOutlineRegular, Modal } from '@deepseek-ai/dsh-client-ui-primitives'
 import type {} from '@deepseek-ai/dsh-client-ui-conversation/client'
 import type {} from './locales.ts'
 import css from './SchedulerTab.module.css'
@@ -398,7 +398,7 @@ export function SchedulerTabView({ t }: SchedulerTabViewProps) {
                 ? <Button variant="outline" size="sm" onClick={() => setConfirming({ kind: 'resume', job })}>{t('resume')}</Button>
                 : <Button variant="outline" size="sm" onClick={() => setConfirming({ kind: 'pause', job })}>{t('pause')}</Button>}
               <Button variant="ghost" size="sm" onClick={() => openEdit(job)}>{t('edit')}</Button>
-              <Button variant="ghost" size="sm" icon={<IconTrashOutline16 />} className={css.scDangerText} onClick={() => setConfirming({ kind: 'delete', job })}>{t('delete')}</Button>
+              <Button variant="ghost" size="sm" icon={<IconTrashOutlineRegular />} className={css.scDangerText} onClick={() => setConfirming({ kind: 'delete', job })}>{t('delete')}</Button>
             </div>
             <div className={css.scJobMeta}>
               {[
