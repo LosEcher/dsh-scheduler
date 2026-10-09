@@ -29,6 +29,7 @@ import { join } from 'node:path'
 import { homedir } from 'node:os'
 import { Store, newId, nowIso } from './lib/store.mjs'
 import { parseCron, nextCronAfter, cronOccurrences, parseInterval, CronParseError } from './lib/cron-next.mjs'
+import { renderModelOverridePatch } from './lib/model-override.mjs'
 
 /** 插件版本（/plugins/<id>/status 约定用；读 package.json，失败返回 null）。 */
 function pluginVersion() {
@@ -744,50 +745,28 @@ export function apply(ctx, config) {
    * source cannot be patched safely (the run then uses the default model).
    */
   function prepareModelOverride(model, runId) {
-    const home = process.env.DSH_HOME ?? `${homedir()}/.dsh`
-    const src = join(home, 'settings.yaml')
-    if (!existsSync(src)) return null
+    const tmpDir = join(cfg.dataDir, 'tmp')
+    const patchPath = join(tmpDir, `patch-${runId}.yml`)
     let text
     try {
-      text = readFileSync(src, 'utf8')
+      text = renderModelOverridePatch(model)
     } catch {
+      // provider/model 不合法 ⇒ 明确降级为"用默认模型"，而不是写一个坏 patch。
       return null
     }
-    // Replace the fixed-shape top-level section:
-    //   agent-default-model:
-    //     provider: ...
-    //     model: ...
-    //     reasoningEffort: ...   (optional)
-    const pat = /^agent-default-model:\n(?:[ \t]+[^\n]*\n)+/m
-    const block = 'agent-default-model:\n'
-      + `  provider: ${model.provider}\n`
-      + `  model: ${model.model}\n`
-      + (model.reasoningEffort ? `  reasoningEffort: ${model.reasoningEffort}\n` : '')
-    const next = pat.test(text) ? text.replace(pat, block) : null
-    if (next === null) return null
-    const tmpDir = join(cfg.dataDir, 'tmp')
-    mkdirSync(tmpDir, { recursive: true })
-    const settingsPath = join(tmpDir, `settings-${runId}.yaml`)
-    const patchPath = join(tmpDir, `patch-${runId}.yml`)
     try {
-      writeFileSync(settingsPath, next, { mode: 0o600 })
-      writeFileSync(
-        patchPath,
-        `# dsh-scheduler per-run model override (generated; do not edit)\n`
-        + `- id: settings\n  config:\n    path: '${settingsPath}'\n`,
-        { mode: 0o600 },
-      )
+      mkdirSync(tmpDir, { recursive: true })
+      writeFileSync(patchPath, text, { mode: 0o600 })
     } catch {
-      try { unlinkSync(settingsPath) } catch { /* ignore */ }
       try { unlinkSync(patchPath) } catch { /* ignore */ }
       return null
     }
-    return { settingsPath, patchPath }
+    return { patchPath }
   }
 
   function cleanupModelOverride(ov) {
     if (!ov) return
-    try { unlinkSync(ov.settingsPath) } catch { /* ignore */ }
+    // patchPath 是唯一产物（2026-10-09 起不再有 settings-<runId>.yaml 中间文件）
     try { unlinkSync(ov.patchPath) } catch { /* ignore */ }
   }
 
