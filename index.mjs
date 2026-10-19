@@ -232,9 +232,15 @@ export function computeDeliveryKey(job, runKey, scheduledFor, now = new Date()) 
  *
  * 判据：文件 mtime ≥ run 开始时间（留 2s 余量）且文件里的 key ≠ 交付键 ⇒ 越界。
  * 记账内容自带 `key` 字段（.sent/.skipped 都是 JSON），所以不必反解 hash。
+ *
+ * ⚠️ 2026-10-18 修正：两个作业的触发窗口重叠时，A 的审计会看到 B 刚写的**合法**交付键，
+ * 于是两条都记 `delivery stray keys`（10-12 实测：weekly-digest 与 federation-gate 同时红）。
+ * `knownKeyPrefixes` 传入其他作业的交付键族（模板 `{{` 前的稳定前缀），命中即视为
+ * 并发作业的合法键，不再算越界；agent 自造的同族键仍会被抓。
  */
-export function findStrayDeliveries(stateDir, deliveryKey, sinceMs) {
+export function findStrayDeliveries(stateDir, deliveryKey, sinceMs, knownKeyPrefixes = []) {
   if (!stateDir || !deliveryKey || !Number.isFinite(sinceMs)) return []
+  const known = Array.isArray(knownKeyPrefixes) ? knownKeyPrefixes.filter(Boolean) : []
   const strays = []
   let names = []
   try { names = readdirSync(stateDir) } catch { return [] }
@@ -246,7 +252,9 @@ export function findStrayDeliveries(stateDir, deliveryKey, sinceMs) {
       if (st.mtimeMs < sinceMs - 2000) continue          // 本次 run 之前写的，不算
       const rec = JSON.parse(readFileSync(full, 'utf8'))
       const key = typeof rec?.key === 'string' ? rec.key : null
-      if (key && key !== deliveryKey) strays.push(key)
+      if (!key || key === deliveryKey) continue
+      if (known.some((prefix) => key.startsWith(prefix))) continue
+      strays.push(key)
     } catch { /* 半写/损坏：跳过 */ }
   }
   return strays
@@ -455,6 +463,23 @@ export function isRetryableFailure(output) {
   if (!output) return true
   if (MODEL_UNAVAILABLE_PATTERNS.some((re) => re.test(output))) return true
   return !NON_RETRYABLE_PATTERNS.some((re) => re.test(output))
+}
+
+/**
+ * 失败告警的水位推进决策：**只有投递成功**才把 `alertedFailures` 推到当前失败链长度，
+ * 否则返回 null（保持原水位）⇒ 下一次失败运行会重新尝试告警。
+ *
+ * 2026-10-09 之前的写法是"推送**之前**先推进水位 + pushFailureAlert 是 fire-and-forget"，
+ * 两者相乘 = 告警丢失且永不重试：2026-10-09 08:35 本机直连出网中断时，
+ * `feishu-push.sh` 返回 `{"ok":false,"error":"token_fetch_failed"}`（exit=1），
+ * 台账却记下 `alertedFailures=2`，日志还写 "failure alert pushed" —— 治理日报连败两天，
+ * **没有人收到过任何告警**。水位与投递结果解耦后，出网恢复的下一次失败即可补发；
+ * 推送脚本自身的 `--key`（含 job+触发时刻+失败链长度）挡住同一失败链的重复投递。
+ */
+export function alertWatermarkAfterPush(input) {
+  if (!input || input.delivered !== true) return null
+  const n = Number(input.consecutiveFailures)
+  return Number.isFinite(n) ? n : null
 }
 
 /**
@@ -1059,7 +1084,15 @@ export function apply(ctx, config) {
       // （重试只会再发一条；已发出的那条只能靠事后清理与审计聚类追踪）。
       if (job.notify) {
         const sinceMs = Number.isFinite(Date.parse(startedAt)) ? Date.parse(startedAt) : Date.now()
-        const strays = findStrayDeliveries(cfg.deliveryStateDir, deliveryKey, sinceMs)
+        // 并发窗口里别的作业写下的合法键：按各自的稳定前缀排除（见 findStrayDeliveries 注释）。
+        const knownPrefixes = store.loadJobs()
+          .filter((other) => other.id !== job.id && other.notify && typeof other.deliveryKey === 'string' && other.deliveryKey)
+          .map((other) => {
+            const t = other.deliveryKey
+            const i = t.indexOf('{{')
+            return i > 0 ? t.slice(0, i) : t
+          })
+        const strays = findStrayDeliveries(cfg.deliveryStateDir, deliveryKey, sinceMs, knownPrefixes)
         if (strays.length > 0) {
           result = {
             ...result,
@@ -1189,8 +1222,26 @@ export function apply(ctx, config) {
       if (!willRetry && result.status !== 'succeeded' && cfg.alertOnConsecutiveFailures > 0
           && updated.consecutiveFailures >= cfg.alertOnConsecutiveFailures
           && (live.alertedFailures ?? 0) < updated.consecutiveFailures) {
-        store.upsertJob({ ...updated, alertedFailures: updated.consecutiveFailures })
-        pushFailureAlert(job, updated, finalRun, attempt, maxAttempts)
+        // 水位只在投递成功后推进（见 alertWatermarkAfterPush）：出网中断导致告警发不出去时
+        // 保持水位不动，下一次失败运行会补发 —— 不再出现"告警丢了但台账以为发过了"。
+        void Promise.resolve(pushFailureAlert(job, updated, finalRun, attempt, maxAttempts))
+          .then((delivered) => {
+            const watermark = alertWatermarkAfterPush({
+              delivered,
+              consecutiveFailures: updated.consecutiveFailures,
+            })
+            if (watermark === null) {
+              ctx.logger.warn(
+                `[dsh-scheduler] failure alert NOT delivered for "${job.name}" (${job.id}) `
+                + `— watermark kept at ${live.alertedFailures ?? 0}; will retry on the next failed run`,
+              )
+              return
+            }
+            store.upsertJob({ ...updated, alertedFailures: watermark })
+          })
+          .catch((error) => {
+            ctx.logger.warn(`[dsh-scheduler] failure alert bookkeeping failed: ${renderThrown(error)}`)
+          })
       }
       scheduleWake()
       } catch (error) {
@@ -1280,7 +1331,7 @@ export function apply(ctx, config) {
       ?? `${homedir()}/.dsh/scripts/feishu-push.sh`
     if (!existsSync(script)) {
       ctx.logger.warn(`[dsh-scheduler] failure alert skipped: ${script} not found`)
-      return
+      return Promise.resolve(false)
     }
     // 去掉旧版的 `- 输出: <模型输出尾部 300 字>`：那是**推理过程**不是结论，实测带进
     // 整段英文（"So sandbox blocked the tmp write. … which is the desired behavior."，
@@ -1301,26 +1352,41 @@ export function apply(ctx, config) {
     // 只发一条（水位已挡重发，这里再挡一层"重启/重试窗口内水位未落盘"的重复；
     // 失败链变长 ⇒ 新 key ⇒ 能继续升级告警，不会被误吞）。
     const alertKey = `${job.id}|${run.scheduledFor}|alert|${updated.consecutiveFailures}`
-    try {
-      const child = spawn('bash', [script, '--key', alertKey, '--max-chars', '500', text], {
-        stdio: ['ignore', 'ignore', 'pipe'],
-        env: { ...process.env, FEISHU_PUSH_STATE_DIR: cfg.deliveryStateDir },
-      })
-      child.stderr.on('data', (d) => {
-        ctx.logger.warn(`[dsh-scheduler] failure alert stderr: ${String(d).slice(0, 200)}`)
-      })
-      child.on('error', (error) => {
-        ctx.logger.warn(`[dsh-scheduler] failure alert push failed: ${renderThrown(error)}`)
-      })
-      child.on('close', (code) => {
-        ctx.logger.info(
-          `[dsh-scheduler] failure alert pushed for "${job.name}" (${job.id}) `
-          + `consecutive=${updated.consecutiveFailures} exit=${code}`,
-        )
-      })
-    } catch (error) {
-      ctx.logger.warn(`[dsh-scheduler] failure alert push error: ${renderThrown(error)}`)
-    }
+    // 返回投递结果（exit 0 = 已发送或 dedup 命中），调用方据此决定是否推进水位；
+    // 本函数仍然**不抛**（告警路径绝不能拖垮 web 宿主）。
+    return new Promise((resolve) => {
+      let settled = false
+      const settle = (delivered, note) => {
+        if (settled) return
+        settled = true
+        resolve(delivered)
+        if (note) ctx.logger.warn(note)
+      }
+      try {
+        const child = spawn('bash', [script, '--key', alertKey, '--max-chars', '500', text], {
+          stdio: ['ignore', 'ignore', 'pipe'],
+          env: { ...process.env, FEISHU_PUSH_STATE_DIR: cfg.deliveryStateDir },
+        })
+        let stderrTail = ''
+        child.stderr.on('data', (d) => {
+          stderrTail = String(d).slice(0, 200)
+          ctx.logger.warn(`[dsh-scheduler] failure alert stderr: ${stderrTail}`)
+        })
+        child.on('error', (error) => {
+          settle(false, `[dsh-scheduler] failure alert push failed: ${renderThrown(error)}`)
+        })
+        child.on('close', (code) => {
+          ctx.logger.info(
+            `[dsh-scheduler] failure alert push finished for "${job.name}" (${job.id}) `
+            + `consecutive=${updated.consecutiveFailures} exit=${code} delivered=${code === 0}`,
+          )
+          settle(code === 0, code === 0 ? null
+            : `[dsh-scheduler] failure alert push exit=${code} (${stderrTail || 'no stderr'})`)
+        })
+      } catch (error) {
+        settle(false, `[dsh-scheduler] failure alert push error: ${renderThrown(error)}`)
+      }
+    })
   }
 
   // ---- scheduler loop -------------------------------------------------------
@@ -1568,6 +1634,8 @@ export function apply(ctx, config) {
     if (input.model === null) delete job.model
     if (input.deliverTo === null) delete job.deliverTo
     if (input.assertCmd === null) delete job.assertCmd
+    if (input.notify === null) delete job.notify
+    if (input.deliveryKey === null) delete job.deliveryKey
     store.upsertJob(job)
     scheduleWake()
     respond(res, 200, { job })
