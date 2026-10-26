@@ -30,6 +30,9 @@ import { homedir } from 'node:os'
 import { Store, newId, nowIso } from './lib/store.mjs'
 import { parseCron, nextCronAfter, cronOccurrences, parseInterval, CronParseError } from './lib/cron-next.mjs'
 import { renderModelOverridePatch } from './lib/model-override.mjs'
+import {
+  classifyFailure, isEnvironmentFailure, describeFailureKind, missingCredential, FAILURE_KINDS,
+} from './lib/failure-class.mjs'
 
 /** 插件版本（/plugins/<id>/status 约定用；读 package.json，失败返回 null）。 */
 function pluginVersion() {
@@ -169,9 +172,29 @@ export const RUN_KEY_PLACEHOLDER = '{{DSH_SCHED_RUN_KEY}}'
  */
 export const DELIVERY_KEY_PLACEHOLDER = '{{DSH_SCHED_DELIVERY_KEY}}'
 
-export function renderPrompt(prompt, runKey, deliveryKey) {
+/**
+ * 预算占位符：本次 run 的时间预算（秒）与硬截止时刻。
+ *
+ * 为什么是 prompt 占位符而不是只靠 env：与 runKey 同一条理由 —— bash 工具不继承
+ * 进程 env（见 RUN_KEY_PLACEHOLDER 注释）。作业要"按剩余预算分配各步超时"
+ * 就必须在 prompt 里看到它，否则只能各自拍一个固定超时，多步叠加就撞总上限
+ * （2026-10-26 台账：feed 作业 14 次撞 1800s 上限，p95 只有 585s）。
+ */
+export const BUDGET_S_PLACEHOLDER = '{{DSH_SCHED_BUDGET_S}}'
+export const DEADLINE_PLACEHOLDER = '{{DSH_SCHED_DEADLINE}}'
+
+export function renderPrompt(prompt, runKey, deliveryKey, budget) {
   let text = String(prompt ?? '')
   if (runKey && text.includes(RUN_KEY_PLACEHOLDER)) text = text.split(RUN_KEY_PLACEHOLDER).join(runKey)
+  // 预算占位符：有预算就替换；没有则原样保留（与 runKey 同一纪律：不留假值）。
+  if (budget && budget.budgetMs > 0) {
+    if (text.includes(BUDGET_S_PLACEHOLDER)) {
+      text = text.split(BUDGET_S_PLACEHOLDER).join(String(Math.round(budget.budgetMs / 1000)))
+    }
+    if (budget.deadlineAt && text.includes(DEADLINE_PLACEHOLDER)) {
+      text = text.split(DEADLINE_PLACEHOLDER).join(budget.deadlineAt)
+    }
+  }
   // 交付键占位符：job 配了 deliveryKey 模板时才有值；没配就**原样保留**
   // （与 runKey 同一条理由：绝不把占位符留成字面量，否则所有 job 共用一个假 key 互相 dedup）。
   if (deliveryKey && text.includes(DELIVERY_KEY_PLACEHOLDER)) {
@@ -516,8 +539,15 @@ export function decideCatchUp(job, cfg, now) {
  */
 export function applyRunResult(job, result, cfg, completedAt) {
   const succeeded = result.status === 'succeeded'
-  const consecutiveFailures = succeeded ? 0 : (job.consecutiveFailures ?? 0) + 1
-  const tripped = !succeeded && consecutiveFailures >= cfg.maxConsecutiveFailures
+  // 环境/配置类失败（缺凭据、超窗、起不来）**保留 failed 状态但不推进失败链**：
+  // 它不是作业内容错，重试与熔断都对它无能为力；把它记成作业失败只会让"这个作业
+  // 不可靠"与"这台机器没准备好"两件事混成一条，而后者需要的是修配置而不是改作业。
+  // 注意：状态仍是 failed（不是 succeeded），且**仍会告警**（见 finish 的环境告警分支）。
+  const environmentFailure = result.environmentFailure === true
+  const consecutiveFailures = succeeded
+    ? 0
+    : environmentFailure ? (job.consecutiveFailures ?? 0) : (job.consecutiveFailures ?? 0) + 1
+  const tripped = !succeeded && !environmentFailure && consecutiveFailures >= cfg.maxConsecutiveFailures
   const paused = job.state === 'paused' || job.enabled === false
   // Failure-alert watermark: success resets it so the next failure streak can
   // alert again; a failed run keeps the previous watermark (the caller bumps
@@ -544,6 +574,11 @@ export function applyRunResult(job, result, cfg, completedAt) {
     // Surfaced by /scheduler/status: how late the last dispatch actually was
     // (host asleep/blocked makes a cron job fire tens of minutes late).
     lastDispatchLatencyMs: result.dispatchLatencyMs ?? job.lastDispatchLatencyMs ?? null,
+    // 归因随作业状态一起暴露（/scheduler/status 与告警文案都能读）：
+    // 成功即清空，避免"上一次为什么失败"被成功掩盖后又被误读成当前状态。
+    lastFailureKind: succeeded ? null : (result.failureKind ?? job.lastFailureKind ?? null),
+    // 环境故障告警水位：同一种环境故障只报一次，成功运行后清空。
+    alertedEnvKind: succeeded ? undefined : job.alertedEnvKind,
     nextRunAt: next ? new Date(next).toISOString() : null,
     state,
     enabled: tripped ? false : job.enabled,
@@ -603,6 +638,18 @@ export function normalizeJob(input, existing) {
     retryDelayMs = Number.isFinite(v) ? Math.min(Math.max(Math.round(v), 5_000), 30 * 60_000) : undefined
   } else if (input.retryDelayMs === null) {
     retryDelayMs = undefined
+  }
+  // timeoutMs: per-job run budget (seconds of wall clock for ONE attempt).
+  // Why per job: the global 30min cap is a safety net, not a plan. Jobs with
+  // many sequential steps + per-step retries hit it while their p95 is far
+  // below it (2026-10-26 ledger: feed job p95 585s, 14 runs killed at 1800s).
+  // null clears the override, undefined keeps.
+  let timeoutMs = existing?.timeoutMs
+  if (input.timeoutMs !== undefined && input.timeoutMs !== null) {
+    const v = Number(input.timeoutMs)
+    timeoutMs = Number.isFinite(v) ? Math.min(Math.max(Math.round(v), 30_000), 4 * 3600_000) : undefined
+  } else if (input.timeoutMs === null) {
+    timeoutMs = undefined
   }
   // model: per-job model override {provider, model, reasoningEffort?, fallback?}
   // run through the headless profile's default model settings. fallback is an
@@ -666,6 +713,7 @@ export function normalizeJob(input, existing) {
     ...(catchUpPolicy ? { catchUpPolicy } : {}),
     ...(maxAttempts !== undefined ? { maxAttempts } : {}),
     ...(retryDelayMs !== undefined ? { retryDelayMs } : {}),
+    ...(timeoutMs !== undefined ? { timeoutMs } : {}),
     ...(model ? { model } : {}),
     ...(assertCmd ? { assertCmd } : {}),
     ...(notify ? { notify } : {}),
@@ -855,6 +903,12 @@ export function apply(ctx, config) {
     // 交付键：默认 = runKey（槽位域，旧行为）；job 配了 deliveryKey 模板则用事件域键
     // （手动/补跑触发同一事件时键不变 ⇒ 幂等成立）。见 computeDeliveryKey 的长注释。
     const deliveryKey = computeDeliveryKey(job, runKey, scheduledFor)
+    // 本 run 的时间预算：job 可覆盖全局上限（见 normalizeJob.timeoutMs 注释）。
+    // 预算同时以三种形态到达子进程：env（给脚本/工具读）+ prompt 占位符（给
+    // agent 读，因为 bash 工具不继承 env）+ 台账 soft 事件（给人事后看）。
+    const runBudgetMs = job.timeoutMs ?? cfg.timeoutMs
+    const deadlineMs = Date.now() + runBudgetMs
+    const budget = { budgetMs: runBudgetMs, deadlineAt: new Date(deadlineMs).toISOString() }
     const runEnv = {
       ...process.env,
       DSH_SCHED_JOB_ID: job.id,
@@ -863,6 +917,9 @@ export function apply(ctx, config) {
       DSH_SCHED_SCHEDULED_FOR: String(scheduledFor ?? ''),
       DSH_SCHED_ATTEMPT: String(attempt),
       DSH_SCHED_DELIVERY_STATE_DIR: cfg.deliveryStateDir,
+      DSH_SCHED_BUDGET_MS: String(runBudgetMs),
+      DSH_SCHED_DEADLINE_MS: String(deadlineMs),
+      DSH_SCHED_DEADLINE: budget.deadlineAt,
     }
     const run = {
       id: runId, jobId: job.id, triggerKind, scheduledFor, attempt, evt: 'start', status: 'running', startedAt,
@@ -906,23 +963,40 @@ export function apply(ctx, config) {
     let settled = false
     let timedOut = false
 
-    // Timeout escalation: SIGTERM at timeoutMs, SIGKILL after killGraceMs.
-    const killTimers = { term: undefined, kill: undefined }
+    // Timeout escalation: SIGTERM at the run budget, SIGKILL after killGraceMs.
+    // 另有一条**软预算**事件（80%）：不发信号、只落台账，用来回答"这个作业是不是
+    // 老是贴着上限跑"——2026-10-26 之前这件事只能在它真的被杀时才知道。
+    const killTimers = { term: undefined, kill: undefined, soft: undefined }
     const clearKillTimers = () => {
       clearTimeout(killTimers.term)
       clearTimeout(killTimers.kill)
+      clearTimeout(killTimers.soft)
     }
+    killTimers.soft = setTimeout(() => {
+      if (settled) return
+      try {
+        store.appendRun({
+          id: runId, jobId: job.id, triggerKind, scheduledFor, attempt, evt: 'budget',
+          budgetMs: runBudgetMs, deadlineAt: budget.deadlineAt, softAt: nowIso(),
+          startedAt, status: 'running',
+        })
+      } catch { /* 观测失败不得影响运行 */ }
+      ctx.logger.warn(
+        `[dsh-scheduler] run ${runId} passed 80% of its ${Math.round(runBudgetMs / 1000)}s budget `
+        + `for job "${job.name}" (${job.id})`,
+      )
+    }, Math.round(runBudgetMs * 0.8))
     killTimers.term = setTimeout(() => {
       if (settled) return
       timedOut = true
-      ctx.logger.warn(`[dsh-scheduler] run ${runId} timed out after ${cfg.timeoutMs}ms; SIGTERM sent`)
+      ctx.logger.warn(`[dsh-scheduler] run ${runId} timed out after ${runBudgetMs}ms; SIGTERM sent`)
       child.kill('SIGTERM')
       killTimers.kill = setTimeout(() => {
         if (settled) return
         ctx.logger.warn(`[dsh-scheduler] run ${runId} still alive ${cfg.killGraceMs}ms after SIGTERM; SIGKILL sent`)
         child.kill('SIGKILL')
       }, cfg.killGraceMs)
-    }, cfg.timeoutMs)
+    }, runBudgetMs)
 
     // Per-job model override: private settings copy + patch, scoped to this run.
     // attempt 1 runs the primary model; later attempts fall back along the
@@ -938,13 +1012,32 @@ export function apply(ctx, config) {
       )
     }
 
+    // 凭据预检（"根本没跑起来"≠"跑失败了"）：白名单 route + 凭据环境变量全缺 ⇒
+    // 记 `skipped: missing_credential`，**不起子进程、不重试、不计入失败链**。
+    // 只对显式声明了 model 的作业生效（默认 route 由 headless profile 决定，
+    // scheduler 无从知道它读哪个变量 ⇒ 那时交给失败归因，绝不猜）。
+    const credGap = missingCredential(runModel, process.env)
+    if (credGap) {
+      ctx.logger.warn(
+        `[dsh-scheduler] run ${runId} skipped: provider route "${credGap.provider}" needs `
+        + `${credGap.envVars.join('|')} but none is set; job "${job.name}" (${job.id}) not started`,
+      )
+      finish({
+        status: 'skipped',
+        skippedReason: 'missing_credential',
+        startedAt,
+        error: `skipped: provider route "${credGap.provider}" has no credential `
+          + `(set ${credGap.envVars.join(' or ')})`,
+      })
+      return
+    }
     // prompt 里的 runKey 占位符在此替换：这是 runKey 到达 agent（进而到达
     // feishu-push.sh --key）的**唯一可靠通道**——bash 工具的环境由 shellEnv
     // registry 重建，不继承进程 env（见 RUN_KEY_PLACEHOLDER 注释）。
     const child = spawn(process.execPath, [
       ...defaultEntry.args, '--profile', 'headless',
       ...(modelOverride ? ['--patch', modelOverride.patchPath] : []),
-      renderPrompt(job.prompt, runKey, deliveryKey),
+      renderPrompt(job.prompt, runKey, deliveryKey, budget),
     ], {
       cwd: workspace,
       env: runEnv,
@@ -961,7 +1054,7 @@ export function apply(ctx, config) {
       if (settled) return
       clearKillTimers()
       if (timedOut) {
-        finish({ status: 'failed', exitCode: code ?? -1, error: `timeout after ${Math.round(cfg.timeoutMs / 1000)}s` })
+        finish({ status: 'failed', exitCode: code ?? -1, error: `timeout after ${Math.round(runBudgetMs / 1000)}s` })
       } else if (signal) {
         finish({ status: 'failed', error: `killed by ${signal}` })
       } else if (code === 0) {
@@ -991,7 +1084,9 @@ export function apply(ctx, config) {
           finish({ status: 'succeeded', exitCode: 0, assertError: renderThrown(error) })
         })
       } else {
-        finish({ status: 'failed', exitCode: code ?? -1 })
+        // 必须写 error：否则台账里只剩 "[attempt N/N] retrying in Ns" 这样的重试簿记，
+        // 根因永远丢失（2026-10-26 实测 39/96 条失败就是这样）。
+        finish({ status: 'failed', exitCode: code ?? -1, error: `exit code ${code ?? 'unknown'}` })
       }
     })
 
@@ -1114,6 +1209,29 @@ export function apply(ctx, config) {
           error: `delivery missing for key "${deliveryKey}"（在 ${cfg.deliveryStateDir} 找不到 .sent；runKey=${runKey}）`,
         }
       }
+      // 失败归因（2026-10-26）：把「为什么失败」写成台账字段，别让根因只活在
+      // 被 tail 截断的输出里。归因不改成败（status 仍由退出码/断言决定），但环境类
+      // 归因（缺凭据/超窗/起不来）会让这次失败**不重试、不计入作业失败链** ——
+      // 重试不可能把凭据变出来（2026-10-17 实测：缺凭据 3 次重试共 1-3 秒，全失败）。
+      if (result.status !== 'succeeded') {
+        // 未运行就结束的 run（skipped）自带原因，直接采用 —— 不要拿它的 error 文案
+        // 再去猜（实测：文案是 "has no credential"，按文本归类会得到 unknown，
+        // 于是环境故障被当成普通失败**重试**了一次）。
+        const kind = FAILURE_KINDS.includes(result.skippedReason)
+          ? result.skippedReason
+          : classifyFailure({
+            error: result.error, output, timedOut,
+            assertFailed: result.assertFailed, exitCode: result.exitCode,
+            deliveryMissing: result.deliveryMissing,
+            deliveryDuplicate: result.deliveryDuplicate,
+            deliveryStray: result.deliveryStray,
+          })
+        result = {
+          ...result,
+          failureKind: kind,
+          ...(isEnvironmentFailure(kind) ? { environmentFailure: true } : {}),
+        }
+      }
       const completedAt = nowIso()
       const durationMs = Date.now() - startedMs
       const maxAttempts = job.maxAttempts ?? cfg.maxAttempts
@@ -1122,7 +1240,9 @@ export function apply(ctx, config) {
       // Assert failures are deterministic: retrying would just re-run the same
       // side effects (including any notification already sent) without fixing
       // the condition. They still count toward the failure streak/alert.
-      const willRetry = failed && !result.assertFailed && !result.deliveryDuplicate && shouldRetry(job, cfg, result.status, output, attempt)
+      const willRetry = failed && !result.assertFailed && !result.deliveryDuplicate
+        && !result.environmentFailure
+        && shouldRetry(job, cfg, result.status, output, attempt)
       const finalRun = {
         ...run,
         ...result,
@@ -1243,6 +1363,27 @@ export function apply(ctx, config) {
             ctx.logger.warn(`[dsh-scheduler] failure alert bookkeeping failed: ${renderThrown(error)}`)
           })
       }
+      // 环境/配置类失败的告警：它不计入失败链（所以走不到上面的阈值分支），
+      // 但**必须报** —— 静默容忍"机器没准备好"比误报失败更危险。水位是
+      // job.alertedEnvKind：同一种环境故障只报一次，成功运行后清空。
+      if (!willRetry && result.environmentFailure && cfg.alertOnConsecutiveFailures > 0
+          && live.alertedEnvKind !== result.failureKind) {
+        void Promise.resolve(pushEnvironmentAlert(job, finalRun, result.failureKind))
+          .then((delivered) => {
+            if (!delivered) {
+              ctx.logger.warn(
+                `[dsh-scheduler] environment alert NOT delivered for "${job.name}" (${job.id}); `
+                + 'will retry on the next environment failure',
+              )
+              return
+            }
+            const latest = store.getJob(job.id)
+            if (latest) store.upsertJob({ ...latest, alertedEnvKind: result.failureKind, updatedAt: nowIso() })
+          })
+          .catch((error) => {
+            ctx.logger.warn(`[dsh-scheduler] environment alert bookkeeping failed: ${renderThrown(error)}`)
+          })
+      }
       scheduleWake()
       } catch (error) {
         settled = true
@@ -1327,12 +1468,6 @@ export function apply(ctx, config) {
   }
 
   function pushFailureAlert(job, updated, run, attempt, maxAttempts) {
-    const script = process.env.DSH_SCHEDULER_ALERT_SCRIPT
-      ?? `${homedir()}/.dsh/scripts/feishu-push.sh`
-    if (!existsSync(script)) {
-      ctx.logger.warn(`[dsh-scheduler] failure alert skipped: ${script} not found`)
-      return Promise.resolve(false)
-    }
     // 去掉旧版的 `- 输出: <模型输出尾部 300 字>`：那是**推理过程**不是结论，实测带进
     // 整段英文（"So sandbox blocked the tmp write. … which is the desired behavior."，
     // 见 COPY-REVIEW §2.1 C4）。原文仍可在 runs.jsonl / 报告里查。
@@ -1352,8 +1487,37 @@ export function apply(ctx, config) {
     // 只发一条（水位已挡重发，这里再挡一层"重启/重试窗口内水位未落盘"的重复；
     // 失败链变长 ⇒ 新 key ⇒ 能继续升级告警，不会被误吞）。
     const alertKey = `${job.id}|${run.scheduledFor}|alert|${updated.consecutiveFailures}`
-    // 返回投递结果（exit 0 = 已发送或 dedup 命中），调用方据此决定是否推进水位；
-    // 本函数仍然**不抛**（告警路径绝不能拖垮 web 宿主）。
+    return pushAlertText(job, alertKey, text, `consecutive=${updated.consecutiveFailures}`)
+  }
+
+  /**
+   * 环境/配置类失败告警：与连败告警共用同一条推送链与幂等键纪律，但文案说明
+   * 「不是作业的问题、重试无用、要修的是环境」，避免和"连败"混成一件事。
+   */
+  function pushEnvironmentAlert(job, run, kind) {
+    const when = fmtLocalTime(run.scheduledFor ?? run.startedAt)
+    const text = [
+      `🟡 定时任务未运行（环境问题）：${jobShortName(job.name)}`,
+      `· 最近一次${when ? ` ${when}` : ''}`,
+      `· 原因：${describeFailureKind(kind)}`,
+      '→ 重试不会自愈，且已按环境故障处理（不计入作业连续失败）',
+    ].filter(Boolean).join('\n')
+    const alertKey = `${job.id}|${run.scheduledFor}|env-alert|${kind}`
+    return pushAlertText(job, alertKey, text, `failureKind=${kind}`)
+  }
+
+  /**
+   * 告警推送的唯一实现（连败告警与环境告警共用）：脚本路径、幂等键语义、
+   * 失败只降级不抛 —— 这些一旦两份实现就会漂移，而告警路径出错最难察觉。
+   * 返回投递结果（exit 0 = 已发送或 dedup 命中），调用方据此决定是否推进水位。
+   */
+  function pushAlertText(job, alertKey, text, label) {
+    const script = process.env.DSH_SCHEDULER_ALERT_SCRIPT
+      ?? `${homedir()}/.dsh/scripts/feishu-push.sh`
+    if (!existsSync(script)) {
+      ctx.logger.warn(`[dsh-scheduler] alert skipped: ${script} not found`)
+      return Promise.resolve(false)
+    }
     return new Promise((resolve) => {
       let settled = false
       const settle = (delivered, note) => {
@@ -1377,14 +1541,14 @@ export function apply(ctx, config) {
         })
         child.on('close', (code) => {
           ctx.logger.info(
-            `[dsh-scheduler] failure alert push finished for "${job.name}" (${job.id}) `
-            + `consecutive=${updated.consecutiveFailures} exit=${code} delivered=${code === 0}`,
+            `[dsh-scheduler] alert push finished for "${job.name}" (${job.id}) `
+            + `${label} exit=${code} delivered=${code === 0}`,
           )
           settle(code === 0, code === 0 ? null
-            : `[dsh-scheduler] failure alert push exit=${code} (${stderrTail || 'no stderr'})`)
+            : `[dsh-scheduler] alert push exit=${code} (${stderrTail || 'no stderr'})`)
         })
       } catch (error) {
-        settle(false, `[dsh-scheduler] failure alert push error: ${renderThrown(error)}`)
+        settle(false, `[dsh-scheduler] alert push error: ${renderThrown(error)}`)
       }
     })
   }

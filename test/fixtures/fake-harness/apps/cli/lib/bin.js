@@ -22,6 +22,30 @@ function fail(msg) {
   process.exit(3)
 }
 
+if (prompt.includes('__ECHO_PROMPT__')) {
+  process.stdout.write(`PROMPT=${prompt}\n`)
+  process.exit(0)
+}
+
+// 预算契约（2026-10-26）：作业要能"按剩余预算分配各步超时"，就必须真的拿到
+// 预算（env 给脚本、prompt 占位符给 agent）。这里断言两者都在，而不是假设。
+if (prompt.includes('__BUDGET_ENV__')) {
+  const missing = ['DSH_SCHED_BUDGET_MS', 'DSH_SCHED_DEADLINE_MS', 'DSH_SCHED_DEADLINE']
+    .filter((k) => !process.env[k])
+  if (missing.length) {
+    process.stderr.write(`missing budget env: ${missing.join(',')}\n`)
+    process.exit(9)
+  }
+  process.exit(0)
+}
+
+// 缺凭据失败形态：与真实 harness 的 `MISSING_CREDENTIAL: …`（行首大写码）逐字同构，
+// 让"失败归因"和"环境类不重试"能在执行路径上被断言。
+if (prompt.includes('__CREDMISS__')) {
+  process.stderr.write('MISSING_CREDENTIAL: no API key for provider route "los"\n')
+  process.exit(1)
+}
+
 if (prompt.includes('__NOENV__')) {
   const missing = ['DSH_SCHED_RUN_KEY', 'DSH_SCHED_JOB_ID', 'DSH_SCHED_DELIVERY_STATE_DIR']
     .filter((k) => !process.env[k])
