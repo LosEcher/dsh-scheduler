@@ -1723,7 +1723,12 @@ export function apply(ctx, config) {
         // 跑飞的另一种形态）。手动触发（operator 意图）与重试（已由 maxAttempts
         // 界定）不经过这里。
         // 500 条上限远大于 cap 的合法上限（96），只为"够用且不整表折叠"。
-        const capDecision = runCapDecision(job, store.listRuns(job.id, 500), nowMs)
+        // ⚠️ 未配置就**不读台账**：`listRuns` 会整份读+折叠 runs.jsonl（生产实测
+        // 3.7MB/5370 行 ≈20ms），而 tick 里每个 due 作业都会走到这里 —— 12 个作业同时
+        // due 就是 240ms 白花在锁内。判据是"配了才检查"，不是"检查完再决定"。
+        const capDecision = job.maxRunsPerDay
+          ? runCapDecision(job, store.listRuns(job.id, 500), nowMs)
+          : { skip: false, used: 0, cap: 0 }
         if (capDecision.skip) {
           const { used, cap } = capDecision
           const next = computeNextRun(job, now)
