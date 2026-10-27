@@ -214,6 +214,74 @@ export function computeRunKey(jobId, scheduledFor) {
 }
 
 /**
+ * 某时刻在指定时区里的日历日（`YYYY-MM-DD`）。`timeZone` 为 undefined/'local'
+ * 时用宿主本地时区；非法时区名**回退到本地而不抛**（一个拼错的时区名不该让
+ * 计数闸门变成"每次 fire 都崩"的故障源，而 job.trigger.timezone 是自由文本）。
+ */
+export function dayKeyInZone(ms, timeZone) {
+  const zone = timeZone && timeZone !== 'local' ? timeZone : undefined
+  const keyOf = (opts) => {
+    const parts = new Intl.DateTimeFormat('en-US', opts).formatToParts(new Date(ms))
+    const get = (t) => parts.find((p) => p.type === t)?.value
+    return `${get('year')}-${get('month')}-${get('day')}`
+  }
+  try {
+    return keyOf({ timeZone: zone, year: 'numeric', month: '2-digit', day: '2-digit' })
+  } catch {
+    return keyOf({ year: 'numeric', month: '2-digit', day: '2-digit' })
+  }
+}
+
+/**
+ * 当日**已启动**的 run 数 —— `maxRunsPerDay` 的计数判据。
+ *
+ * 三条判据各自有理由，改之前先看：
+ *  ① **只数 `attempt === 1`**：重试次数已由 `maxAttempts` 界定，是有限的；而"跑飞"
+ *     是**无限重复触发**（catch-up 重放、cron 槽与 ad-hoc 叠加、崩了重启再 fire ——
+ *     2026-08-18 那次 fire→crash→restart→refire 推了 10+ 条重复消息）。那些全是
+ *     首次触发。把重试计入会让「cap=1 + maxAttempts=2」直接压掉正常重试。
+ *  ② **只数真的起了子进程的 run**（`status !== 'skipped'`）：skip 不消耗资源。若把
+ *     skip 也计入，一个配错的作业会把额度耗在"什么都没做"上，然后一整天正常触发
+ *     全被自己的 skip 挤掉。
+ *  ③ **按作业自己的时区算"今天"**：`job.trigger.timezone` 是 'local' 或 IANA 名，
+ *     缺省用宿主本地时区。否则 08:00 Asia/Shanghai 的作业在宿主为 UTC 时会被日界
+ *     切成两半，"每天最多 N 次"就不是它自己的每天了。
+ *
+ * 入参 `runs` 是 `store.listRuns(jobId, …)` 的**派生视图**（已折叠 status），不是原始
+ * 事件流 —— 原始事件里只有 `evt:'start'` 的 run 若宿主崩了没有 finish，折出来才是
+ * `interrupted`，那种 run **确实起过子进程，必须计入**。
+ */
+export function runsToday(runs, timeZone, nowMs = Date.now()) {
+  const today = dayKeyInZone(nowMs, timeZone)
+  let n = 0
+  for (const r of runs) {
+    if ((r.attempt ?? 1) !== 1) continue
+    if (r.status === 'skipped') continue
+    const t = Date.parse(r.startedAt ?? '')
+    if (!Number.isFinite(t)) continue
+    if (dayKeyInZone(t, timeZone) === today) n += 1
+  }
+  return n
+}
+
+/**
+ * 派发前的计数闸门判定（纯函数，便于单测）。
+ *
+ * 三态刻意只分两种（skip / 不 skip）——**"判不了"不在这里**：计数只依赖本地
+ * append-only 台账（读不到就没有 run，等于"今天还没跑过"，fail-open 是正确方向：
+ * 台账损坏时拦住所有作业的代价远大于多跑一次）。
+ *
+ * 未配置（`maxRunsPerDay` 缺失/非法/非正）⇒ 永远不 skip：保护是 opt-in 的，
+ * 不能因为字段拼错就静默停掉一个作业。
+ */
+export function runCapDecision(job, runs, nowMs = Date.now()) {
+  const cap = job?.maxRunsPerDay
+  if (!Number.isInteger(cap) || cap <= 0) return { skip: false, used: 0, cap: 0 }
+  const used = runsToday(runs ?? [], job.trigger?.timezone, nowMs)
+  return { skip: used >= cap, used, cap }
+}
+
+/**
  * 交付键（幂等键）——**事件域**，默认等于 runKey（槽位域）。
  *
  * 为什么需要它（2026-10-07 用 .sent 台账定位到根因）：runKey = `jobId|scheduledFor` 是
@@ -651,6 +719,27 @@ export function normalizeJob(input, existing) {
   } else if (input.timeoutMs === null) {
     timeoutMs = undefined
   }
+  // maxRunsPerDay: 当日**首次触发**次数上限（跑飞保护）。null 清除，undefined 保持。
+  //
+  // 为什么需要它（依据是事故不是成本，2026-10-28 定调）：2026-08-18 的
+  // fire→crash→restart→refire 循环把同一个过期 occurrence 触发了 10+ 次、
+  // 推了 10+ 条重复消息。根因（dispatch 时先推进 nextRunAt）已修、`deliveryKey`
+  // 幂等也已兜底，但**这两个都在防"同一事件重复"**，防不住"一天被触发 20 次不同
+  // occurrence"（cron 与 ad-hoc 叠加、补跑风暴）。这一层是确定性计数器：
+  // 不依赖任何外部账本、事前可判、一天一个日界。
+  //
+  // **它不是预算闸门**：实测定时作业只占 DSH 全部花费 2.2%，按钱设阈值的收益
+  // （峰段全挪低谷上限 ≈¥5/月）不成立，那件事已判定不做（见
+  // dsfolder/BUDGET-CONTROLLED-SCHEDULING-2026-10-28.md）。
+  //
+  // 计数判据见 runsToday()：只数 attempt===1、只数真起了子进程的、按作业时区算日界。
+  let maxRunsPerDay = existing?.maxRunsPerDay
+  if (input.maxRunsPerDay !== undefined && input.maxRunsPerDay !== null) {
+    const v = Number(input.maxRunsPerDay)
+    maxRunsPerDay = Number.isInteger(v) ? Math.min(Math.max(v, 1), 96) : undefined
+  } else if (input.maxRunsPerDay === null) {
+    maxRunsPerDay = undefined
+  }
   // model: per-job model override {provider, model, reasoningEffort?, fallback?}
   // run through the headless profile's default model settings. fallback is an
   // ordered list of models tried on later attempts (attempt 1 uses the primary
@@ -714,6 +803,7 @@ export function normalizeJob(input, existing) {
     ...(maxAttempts !== undefined ? { maxAttempts } : {}),
     ...(retryDelayMs !== undefined ? { retryDelayMs } : {}),
     ...(timeoutMs !== undefined ? { timeoutMs } : {}),
+    ...(maxRunsPerDay !== undefined ? { maxRunsPerDay } : {}),
     ...(model ? { model } : {}),
     ...(assertCmd ? { assertCmd } : {}),
     ...(notify ? { notify } : {}),
@@ -1622,6 +1712,36 @@ export function apply(ctx, config) {
           ctx.logger.info(
             `[dsh-scheduler] job "${job.name}" (${job.id}) missed occurrence skipped `
             + `(late by ${Math.round(decision.latenessMs / 1000)}s, max ${Math.round(cfg.maxLatenessMs / 1000)}s)`,
+          )
+          continue
+        }
+        // 当日首次触发次数上限（跑飞保护）。
+        // 位置刻意留在**派发前的最后一道闸**：前面的 catch-up 判据先决定"这次
+        // occurrence 还算不算数"，这里只决定"今天还许不许再起子进程"。
+        // 处置方式照抄 catch-up skip —— **必须推进 nextRunAt**：否则作业一直处于
+        // due 状态，tick 每拍都会再判一次，账本会被自己的 skip 刷屏（那正是要防的
+        // 跑飞的另一种形态）。手动触发（operator 意图）与重试（已由 maxAttempts
+        // 界定）不经过这里。
+        // 500 条上限远大于 cap 的合法上限（96），只为"够用且不整表折叠"。
+        const capDecision = runCapDecision(job, store.listRuns(job.id, 500), nowMs)
+        if (capDecision.skip) {
+          const { used, cap } = capDecision
+          const next = computeNextRun(job, now)
+          store.appendRun({
+            id: newId('run'), jobId: job.id, triggerKind: 'scheduled', scheduledFor: job.nextRunAt,
+            evt: 'skipped', status: 'skipped', startedAt: nowIso(), completedAt: nowIso(),
+            skippedReason: 'max_runs_per_day',
+            runsToday: used, maxRunsPerDay: cap,
+            error: `daily run cap reached (${used}/${cap} runs today)`,
+          })
+          store.upsertJob({
+            ...job,
+            nextRunAt: next ? new Date(next).toISOString() : null,
+            updatedAt: nowIso(),
+          })
+          ctx.logger.warn(
+            `[dsh-scheduler] job "${job.name}" (${job.id}) hit maxRunsPerDay=${cap} `
+            + `(${used} run(s) today); occurrence ${job.nextRunAt} skipped`,
           )
           continue
         }
