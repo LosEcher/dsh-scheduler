@@ -811,6 +811,38 @@ export function normalizeJob(input, existing) {
   }
 }
 
+/**
+ * 可被 `PATCH {...: null}` 显式清除的作业字段（白名单）。
+ *
+ * ⚠️ 为什么它必须是一张表而不是逐个 `if`（2026-10-28 实测的静默失效）：
+ * `normalizeJob` 把 `null` 解释为"清空"时**不会把该键放进返回值**，而 `routeUpdateJob`
+ * 用 `{...existing, ...fields}` 合成新作业 ⇒ 旧值会被复活。所以每个可清除字段都要在
+ * 合成后 `delete`。原先这张表是 5 个手写 `if`（model/deliverTo/assertCmd/notify/
+ * deliveryKey），而**后加的 maxAttempts / retryDelayMs / timeoutMs / maxRunsPerDay
+ * 一个都没进去** ⇒ 文档里写的回滚 `PATCH {"maxRunsPerDay": null}` 是**空操作**：
+ * 返回 200、值原封不动。这类"漏一个就静默失效"的开关不适合逐个 if。
+ *
+ * 判据：凡是 `normalizeJob` 里有 `else if (input.X === null) X = undefined` 分支的字段，
+ * 就必须出现在这里（`test/run-cap.test.mjs` 的白名单用例钉住这一条）。
+ */
+export const EXPLICIT_CLEAR_KEYS = [
+  'model', 'deliverTo', 'assertCmd', 'notify', 'deliveryKey',
+  'catchUpPolicy', 'maxAttempts', 'retryDelayMs', 'timeoutMs', 'maxRunsPerDay',
+]
+
+/**
+ * 把 `null` 显式清除真正落到合成后的作业对象上（就地修改并返回）。
+ *
+ * 只删"用户显式传了 null **且** normalizeJob 没有给出新值"的键 —— 传 `undefined`
+ * （即 body 里没这个键）必须保持原值，这是 PATCH 的语义底线，也是本函数的负向控制。
+ */
+export function applyExplicitClears(job, input, fields) {
+  for (const key of EXPLICIT_CLEAR_KEYS) {
+    if (input?.[key] === null && !(key in fields)) delete job[key]
+  }
+  return job
+}
+
 /** Validate a fallback chain: array of {provider, model, reasoningEffort?}. */
 function normalizeModelChain(fallback) {
   if (fallback === undefined || fallback === null) return []
@@ -1920,11 +1952,8 @@ export function apply(ctx, config) {
     }
     // Explicit-clears: normalizeJob omits keys it cleared, but {...existing}
     // would then resurrect them — delete instead so null truly removes.
-    if (input.model === null) delete job.model
-    if (input.deliverTo === null) delete job.deliverTo
-    if (input.assertCmd === null) delete job.assertCmd
-    if (input.notify === null) delete job.notify
-    if (input.deliveryKey === null) delete job.deliveryKey
+    // 白名单表见 EXPLICIT_CLEAR_KEYS（漏一个 = 那个字段的回滚静默失效）。
+    applyExplicitClears(job, input, fields)
     store.upsertJob(job)
     scheduleWake()
     respond(res, 200, { job })

@@ -19,7 +19,7 @@ const mod = await import(pathToFileURL(
   `${process.env.HOME}/.dsh/profiles/web/node_modules/dsh-scheduler/index.mjs`,
 ).href)
 
-const { dayKeyInZone, runsToday, runCapDecision, normalizeJob } = mod
+const { dayKeyInZone, runsToday, runCapDecision, normalizeJob, applyExplicitClears, EXPLICIT_CLEAR_KEYS } = mod
 
 // 边界时刻：北京时间 2026-10-28 01:00 = UTC 2026-10-27 17:00 ⇒ 东八区与 UTC 不同日。
 const BOUNDARY = Date.parse('2026-10-28T01:00:00+08:00')
@@ -130,4 +130,42 @@ test('normalizeJob：maxRunsPerDay 的钳位与清除语义', () => {
   assert.equal(normalizeJob({ ...base, maxRunsPerDay: null }, existing).maxRunsPerDay, undefined, 'null ⇒ 清除')
   // 全新作业且未声明 ⇒ 结果里**没有这个键**（不是 0/undefined 占位）。
   assert.equal('maxRunsPerDay' in normalizeJob({ ...base }), false)
+})
+
+// ── PATCH 的 null 回滚必须真的清掉 ────────────────────────────────────────────
+// 背景（2026-10-28 实测的静默失效）：`normalizeJob` 把 null 解释成"清空"时**不把
+// 该键放进返回值**，而 routeUpdateJob 用 `{...existing, ...fields}` 合成 ⇒ 旧值复活。
+// 于是"文档里写的回滚 `PATCH {"maxRunsPerDay": null}`"返回 200 但值还在 —— 一个
+// HTTP 层看不出来的空操作。这里用纯函数把那条合成逻辑钉住（routeUpdateJob 是闭包
+// 内函数，HTTP 层另有 host-smoke 覆盖）。
+const patchJob = (existing, body) => {
+  const fields = normalizeJob({ ...existing, ...body }, existing)
+  return applyExplicitClears({ ...existing, ...fields }, body, fields)
+}
+
+test('PATCH null 真清除：maxRunsPerDay 回滚不是空操作', () => {
+  const job = { name: 't', prompt: 'p', trigger: { kind: 'interval', expression: '1d' }, workspace: '/tmp', enabled: true, maxRunsPerDay: 6 }
+  const cleared = patchJob(job, { maxRunsPerDay: null })
+  assert.equal('maxRunsPerDay' in cleared, false, 'null 必须让键消失（否则回滚无效）')
+  // 负向控制：同一个 job 只改 prompt（body 里没有这个键）⇒ 保护必须还在，
+  // 否则一次无关的 PATCH 就能把跑飞保护静默关掉。
+  assert.equal(patchJob(job, { prompt: 'p2' }).maxRunsPerDay, 6, 'undefined ⇒ 沿用，不得清除')
+  // 负向控制：改成别的值也要保留（白名单只对 null 生效）。
+  assert.equal(patchJob(job, { maxRunsPerDay: 3 }).maxRunsPerDay, 3)
+})
+
+test('白名单必须覆盖 normalizeJob 的每个 null 清除分支（漏一个 = 那个字段回滚失效）', () => {
+  // 判据反向生成：把 maxRunsPerDay 换成别的字段名时，若 normalizeJob 有 null 分支
+  // 而白名单没有它，这条就会红。当前名单是静态的，但断言"名单里的每个键都真的能被
+  // null 清除"能防住"加进名单却没实现清除"的反向错误。
+  const job = {
+    name: 't', prompt: 'p', trigger: { kind: 'interval', expression: '1d' }, workspace: '/tmp', enabled: true,
+    ...Object.fromEntries(EXPLICIT_CLEAR_KEYS.filter((k) => k !== 'model' && k !== 'notify').map((k) => [k, k === 'maxAttempts' || k === 'maxRunsPerDay' || k === 'retryDelayMs' || k === 'timeoutMs' ? 5 : 'x'])),
+    model: { provider: 'a', model: 'b' },
+    notify: { channel: 'feishu' },
+  }
+  for (const key of EXPLICIT_CLEAR_KEYS) {
+    const cleared = patchJob(job, { [key]: null })
+    assert.equal(key in cleared, false, `PATCH {${key}: null} 必须清掉该键`)
+  }
 })
