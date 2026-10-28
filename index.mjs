@@ -60,6 +60,29 @@ const LOADED_VERSION = pluginVersion()
 export const name = 'dsh-scheduler'
 export const inject = ['webServer', 'agents']
 
+/**
+ * 交付目录里**别的写者**产出的 key 前缀（默认白名单）。
+ *
+ * 单一真源：`Config.externalDeliveryPrefixes` 的默认值与 `resolveConfig()` 的回落
+ * 都引用它，避免"默认值"和"运行时值"两处各写一份而漂移。
+ *
+ * 为什么需要（2026-10-28 实测，7 天 8 次失败里 6 次是它）：
+ *   - `~/.dsh/scripts/health-alerts.sh` → `health-alerts-<YYYYMMDD-HH>`（launchd 每天 09:05）
+ *   - `dsfolder/scripts/los-task-attention.mjs` → `los-task-digest:<YYYY-MM-DD>`
+ * 两者都写同一个 deliveryStateDir，于是它们的**合法**写入会被调度作业的
+ * 越界检测判成 stray（10-28 09:12/09:13 双红于 `health-alerts-20261028-09`、
+ * 10-23 双红于 `los-task-digest:2026-10-23`）。
+ *
+ * 判据边界：前缀白名单只豁免**别的写者**的键；本次运行自己被注入的 deliveryKey
+ * 仍必须出现（主判据不变），同族里 agent 自造的其它键仍然算越界。
+ *
+ * 视为只读常量：不要在运行时 push/splice 它。
+ */
+export const DEFAULT_EXTERNAL_DELIVERY_PREFIXES = [
+  'health-alerts-',
+  'los-task-digest:',
+]
+
 // schemastery `.default()` stores the argument AS-IS (a literal): a factory
 // function would fail Cordis string validation and take down the whole web
 // plugin tree. Following the harness convention (settings-file: "defaulting
@@ -112,6 +135,22 @@ export const Config = Schema.object({
    * assert 的盲区里）。
    */
   deliveryStateDir: Schema.string(),
+  /**
+   * 交付目录里**不属于本调度器**的写者所产出的 key 前缀白名单。
+   *
+   * 为什么需要（2026-10-28 实测踩到，7 天 8 次失败里 6 次是它）：投递越界检测
+   * 只看「本次 run 期间目录里出现了别的 key」。原来的豁免集**只来自其他调度作业**
+   * 的交付键模板，但同一个 deliveryStateDir 还被外部 launchd 脚本写入：
+   *   - `~/.dsh/scripts/health-alerts.sh:445` → `health-alerts-<YYYYMMDD-HH>`（每天 09:05）
+   *   - `scripts/los-task-attention.mjs:124`  → `los-task-digest:<YYYY-MM-DD>`
+   * 于是**两个调度作业同时被别人的合法写入判红**（10-28 09:12/09:13 双红于
+   * `health-alerts-20261028-09`；10-23 双红于 `los-task-digest:2026-10-23`）。
+   *
+   * 判据边界：这些前缀只豁免**别的写者的合法键**；同一前缀族里 agent 自造的键
+   * （如作业用 `health-alerts-` 前缀自己发一条）仍然算越界 —— 白名单只做前缀匹配，
+   * 不改变「本次交付键必须是被注入的那一个」这条主判据。
+   */
+  externalDeliveryPrefixes: Schema.array(Schema.string()).default(DEFAULT_EXTERNAL_DELIVERY_PREFIXES),
   /** Max lateness for 'skip' catch-up; 0 = unlimited (never skip). */
   maxLatenessMs: Schema.number().min(0).default(15 * 60_000),
   /**
@@ -147,6 +186,9 @@ export function resolveConfig(config) {
     maxRuns: config.maxRuns ?? 5000,
     assertTimeoutMs: config.assertTimeoutMs ?? 60_000,
     deliveryStateDir: config.deliveryStateDir ?? `${dshHome}/storages/feishu-push`,
+    externalDeliveryPrefixes: Array.isArray(config.externalDeliveryPrefixes)
+      ? config.externalDeliveryPrefixes.filter((p) => typeof p === 'string' && p.length > 0)
+      : DEFAULT_EXTERNAL_DELIVERY_PREFIXES,
   }
 }
 
@@ -342,6 +384,12 @@ export function computeDeliveryKey(job, runKey, scheduledFor, now = new Date()) 
  * 于是两条都记 `delivery stray keys`（10-12 实测：weekly-digest 与 federation-gate 同时红）。
  * `knownKeyPrefixes` 传入其他作业的交付键族（模板 `{{` 前的稳定前缀），命中即视为
  * 并发作业的合法键，不再算越界；agent 自造的同族键仍会被抓。
+ *
+ * ⚠️ 2026-10-28 修正（第二类合法写者）：白名单原先只来自**其他调度作业**，但同一个
+ * deliveryStateDir 还被宿主外的 launchd 脚本写入（`health-alerts-*` 每天 09:05、
+ * `los-task-digest:<日期>`）⇒ 别人的合法写入被判红（7 天 8 次失败里 6 次）。
+ * 现在调用方把 `cfg.externalDeliveryPrefixes`（默认见 DEFAULT_EXTERNAL_DELIVERY_PREFIXES）
+ * 一并并入白名单；**只做前缀匹配**，主判据（本次注入的 deliveryKey 必须出现）不变。
  */
 export function findStrayDeliveries(stateDir, deliveryKey, sinceMs, knownKeyPrefixes = []) {
   if (!stateDir || !deliveryKey || !Number.isFinite(sinceMs)) return []
@@ -368,6 +416,28 @@ export function findStrayDeliveries(stateDir, deliveryKey, sinceMs, knownKeyPref
 /** 与 feishu-push.sh 的 key_hash 逐位对齐：sha256(key) 的 hex 前 16 位。 */
 export function deliveryKeyHash(key) {
   return createHash('sha256').update(String(key), 'utf8').digest('hex').slice(0, 16)
+}
+
+/**
+ * 组装"别的写者的合法键前缀"白名单，交给 `findStrayDeliveries`。
+ *
+ * 独立成纯函数是为了让**接线本身可机械验收**：本仓反复踩过的缺陷类别是
+ * 「声明了但没生效」（字段加进 Config，调用点忘了传）。这里既覆盖
+ * ①并发作业的交付键族（模板 `{{` 之前是稳定前缀）②宿主外部写者的前缀，
+ * 又排除当前作业自己的族（自己的键由主判据「必须出现」负责，不能靠白名单）。
+ */
+export function collectKnownDeliveryPrefixes(otherJobs, jobId, externalPrefixes = []) {
+  const fromJobs = (Array.isArray(otherJobs) ? otherJobs : [])
+    .filter((other) => other && other.id !== jobId && other.notify
+      && typeof other.deliveryKey === 'string' && other.deliveryKey)
+    .map((other) => {
+      const t = other.deliveryKey
+      const i = t.indexOf('{{')
+      return i > 0 ? t.slice(0, i) : t
+    })
+  const externals = (Array.isArray(externalPrefixes) ? externalPrefixes : [])
+    .filter((p) => typeof p === 'string' && p.length > 0)
+  return [...fromJobs, ...externals]
 }
 
 /**
@@ -1316,13 +1386,13 @@ export function apply(ctx, config) {
       if (job.notify) {
         const sinceMs = Number.isFinite(Date.parse(startedAt)) ? Date.parse(startedAt) : Date.now()
         // 并发窗口里别的作业写下的合法键：按各自的稳定前缀排除（见 findStrayDeliveries 注释）。
-        const knownPrefixes = store.loadJobs()
-          .filter((other) => other.id !== job.id && other.notify && typeof other.deliveryKey === 'string' && other.deliveryKey)
-          .map((other) => {
-            const t = other.deliveryKey
-            const i = t.indexOf('{{')
-            return i > 0 ? t.slice(0, i) : t
-          })
+        // 再并入**宿主外部写者**的前缀（launchd 脚本 health-alerts / los-task-digest）：
+        // 它们写同一个目录，不白名单就会把别人的合法写入判成我们的越界。
+        const knownPrefixes = collectKnownDeliveryPrefixes(
+          store.loadJobs(),
+          job.id,
+          cfg.externalDeliveryPrefixes,
+        )
         const strays = findStrayDeliveries(cfg.deliveryStateDir, deliveryKey, sinceMs, knownPrefixes)
         if (strays.length > 0) {
           result = {
