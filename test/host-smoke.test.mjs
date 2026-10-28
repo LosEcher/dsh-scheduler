@@ -161,6 +161,10 @@ test('host 冒烟：真实宿主库加载入口 + 注入/路由契约 + CLI 解�
     assert.equal(st.json.ok, true)
     assert.equal(st.json.plugin, 'dsh-scheduler')
     assert.equal(typeof st.json.version, 'string')
+    // loadedVersion = 进程加载时读到的那份 package.json，与"磁盘上的"分开报：
+    // 磁盘值会立刻反映改动，只有它不能证明新代码在跑（2026-10-28 的假绿）。
+    assert.equal(typeof st.json.loadedVersion, 'string')
+    assert.equal(st.json.loadedVersion, st.json.version, '本测试里刚加载 ⇒ 两者应相同')
     assert.equal(st.json.lastError, null)
     assert.equal(st.json.counts.jobs, 0, '临时数据目录里应无 job')
     assert.equal(st.json.counts.inflight, 0)

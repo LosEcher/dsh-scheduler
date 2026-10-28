@@ -43,6 +43,20 @@ function pluginVersion() {
   }
 }
 
+/**
+ * **进程启动时**加载到的版本 —— 与 `pluginVersion()` 是两件事，必须分开报。
+ *
+ * 为什么（2026-10-28 实测的假绿）：`pluginVersion()` 每次调用都从磁盘读 package.json，
+ * 而插件目录是 `link:` 到工作树的符号链接 ⇒ 改完代码、还没重启宿主时它**立刻**就返回
+ * 新版本号。于是"status 里 version=0.5.6"被当成"新代码在跑"，而实际上进程加载的是
+ * 07:32 那份 index.mjs（`maxRunsPerDay` 全被静默丢弃）。
+ *
+ * 判据：**磁盘版本 ≠ 运行中的代码**。`version` = 磁盘（可用于发现"有更新待重启"），
+ * `loadedVersion` = 本次进程真的加载的那份（可用于判断某个修复是否生效）。
+ * 两者不等 ⇒ 有一次待生效的重启。
+ */
+const LOADED_VERSION = pluginVersion()
+
 export const name = 'dsh-scheduler'
 export const inject = ['webServer', 'agents']
 
@@ -2030,7 +2044,10 @@ export function apply(ctx, config) {
       respond(r, 200, {
         ok: true,
         plugin: 'dsh-scheduler',
+        // version = 磁盘上的 package.json；loadedVersion = 本进程启动时加载的那份。
+        // 两者不等说明"代码改了但宿主还没重启"（见 LOADED_VERSION 的长注释）。
         version: pluginVersion(),
+        loadedVersion: LOADED_VERSION,
         counts: {
           jobs: jobs.length,
           enabled: jobs.filter((j) => j.enabled && j.state !== 'paused' && j.state !== 'completed').length,
