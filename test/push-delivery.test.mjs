@@ -531,6 +531,11 @@ test('findStrayDeliveries：本次 run 期间写入的非交付键被抓出来�
   writeFileSync(join(dir, 'c.skipped'), JSON.stringify({ key: 'feed-fault-20261007', reason: 'x', at: new Date().toISOString() }))
   assert.equal(mod.findStrayDeliveries(dir, good, since).length, 2)
 
+  // 2026-10-18：并发作业的合法键（已知族前缀）不算越界；同族自造键仍要抓
+  assert.deepEqual(mod.findStrayDeliveries(dir, good, since, ['feed-']), [])
+  writeFileSync(join(dir, 'f.sent'), JSON.stringify({ key: 'evt-20261018', messageId: 'om_4', sentAt: new Date().toISOString() }))
+  assert.ok(mod.findStrayDeliveries(dir, good, since, ['feed-']).includes('evt-20261018'))
+
   // 旧文件（本次 run 之前）：不算
   const oldFile = join(dir, 'd.sent')
   writeFileSync(oldFile, JSON.stringify({ key: 'stale-key', messageId: 'om_3', sentAt: '2020-01-01T00:00:00Z' }))
