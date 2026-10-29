@@ -8,7 +8,7 @@
  */
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { mkdtempSync, rmSync } from 'node:fs'
+import { mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { Store, newId, nowIso } from '../lib/store.mjs'
@@ -168,6 +168,26 @@ test('rotation keeps the newest maxRuns lines and archives the rest by month', (
   assert.equal(july.length, 2)
   assert.match(july[0], /run-0/)
   assert.equal(store.readArchive('2026-09').length, 0)
+})
+
+test('rotation also honors rotateBytes when line count is under maxRuns', (t) => {
+  // 2026-10-29 实测的形态：live 正好 maxRuns(5000) 行、体积 3.7 MB，旧实现「行数不超限」直接
+  // return ⇒ rotateBytes 触发了却什么也没做。这里用「行数远低于上限、体积超限」把那条路径钉住。
+  const dir = mkdtempSync(join(tmpdir(), 'dsh-scheduler-rotate-bytes-'))
+  t.after(() => rmSync(dir, { recursive: true, force: true }))
+  const store = new Store(dir, { maxRuns: 100, rotateBytes: 500 })
+  const lines = [0, 1, 2].map((i) => JSON.stringify({
+    id: `run-${i}`, jobId: 'job-1', evt: 'finish', status: 'succeeded',
+    startedAt: '2026-08-18T00:00:00.000Z', pad: 'x'.repeat(200),
+  }))
+  const runsPath = join(dir, 'runs.jsonl')
+  writeFileSync(runsPath, lines.join('\n') + '\n')
+  assert.ok(statSync(runsPath).size > 500, 'fixture must exceed rotateBytes')
+  const result = store.rotateRuns()
+  assert.ok(result.archived >= 1, 'must archive at least one line')
+  assert.ok(result.kept < 3)
+  assert.equal(result.rotatedBy, 'bytes')
+  assert.ok(statSync(runsPath).size <= 500, 'live file must be back under the byte cap')
 })
 
 test('rotation is a no-op below maxRuns', (t) => {
