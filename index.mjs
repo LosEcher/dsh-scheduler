@@ -354,7 +354,17 @@ export function computeDeliveryKey(job, runKey, scheduledFor, now = new Date()) 
   const template = job && typeof job.deliveryKey === 'string' ? job.deliveryKey.trim() : ''
   if (!template) return runKey
   const pad = (n) => String(n).padStart(2, '0')
-  const d = now instanceof Date && !Number.isNaN(now.getTime()) ? now : new Date()
+  // 本地时间字段以 **scheduledFor（事件时刻）** 为基准，而不是 attempt 的墙钟（2026-10-29 实测修）。
+  //
+  // 为什么：本函数的契约是"一次真实事件只推一条"。同一 scheduledFor 的重试 runKey 不变，
+  // 但 `{{hour}}` 曾用 `now`（attempt 启动时刻）渲染 ⇒ 跨小时重试就换键，去重失效。
+  // 实证：cd7 的 attempt1 键 …-20261028-08、attempt2/3 键 …-20261028-09（同一 runKey）。
+  // scheduledFor 缺失/不可解析时才退回 now（手动补跑仍可用）。
+  const scheduled = typeof scheduledFor === 'string' ? new Date(scheduledFor) : null
+  const base = scheduled !== null && !Number.isNaN(scheduled.getTime())
+    ? scheduled
+    : (now instanceof Date && !Number.isNaN(now.getTime()) ? now : new Date())
+  const d = base
   const local = {
     date: `${d.getFullYear()}${pad(d.getMonth() + 1)}${pad(d.getDate())}`,
     hour: pad(d.getHours()),
@@ -1456,6 +1466,15 @@ export function apply(ctx, config) {
         durationMs,
         outputHead: output,
         completedAt,
+      }
+      if (failed && !finalRun.error) {
+        // 2026-10-28 审计：失败但没有任何 error 时，台账最终只剩 "[attempt N/N] gave up"
+        // —— 30 天实测里 los 治理日报 8/32、验证资产维护 3/8、生态周盘点 2/6、
+        // 竞品 2/4 的最终 error 就是一句重试簿记（竞品那两条连 error 字段都没有）。
+        // 根因不可诊断 = 台账回答不了"为什么红"。这里兜一层「至少记清是什么失败」，
+        // 并把细节指路到 outputHead（它一直在记，只是没被指明用途）。
+        finalRun.error = `failed (status=${result.status}, exit=${result.exitCode ?? 'unknown'})`
+          + (output ? '；细节见 outputHead' : '；无输出')
       }
       if (willRetry) {
         finalRun.error = (finalRun.error ? `${finalRun.error}; ` : '')
