@@ -627,6 +627,16 @@ const NON_RETRYABLE_PATTERNS = [
   /\bforbidden\b/i,
   /\bbilling\s+(error|issue|problem)\b/i,
   /\baccount\s+(disabled|suspended|banned)\b/i,
+  // Credential-absent failures (2026-10-30 实测): the harness reports these as
+  // `MISSING_CREDENTIAL: ... no API key for provider route "x"` / `no credential
+  // for provider route "y"; its profile resolves Z, which is not set`. Missing a
+  // key is a **persistent configuration state**, not a transient one — but none of
+  // the auth patterns above match the wording, so these stayed retryable and each
+  // occurrence burned the full maxAttempts (实测 feed 作业 2026-10-17 13:36/13:37/
+  // 13:38 与 10-18 00:35/00:36/00:37 各 3 次 = 6 次会话，全部注定失败).
+  /\bMISSING_CREDENTIAL\b/i,
+  /\bno\s+(api\s*)?key\s+for\s+provider\b/i,
+  /\bno\s+credential\s+for\s+provider\b/i,
 ]
 
 /**

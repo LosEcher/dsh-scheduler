@@ -37,6 +37,25 @@ test('isRetryableFailure: model-unavailable errors are retryable even when frame
   assert.equal(isRetryableFailure('authentication failed: unauthorized'), false)
 })
 
+test('isRetryableFailure: credential-absent failures are NOT retryable (2026-10-30)', async () => {
+  const { isRetryableFailure } = await import(pluginHref)
+  // 实证原文（feed 作业 10-17/10-18 各烧 3 次会话）：缺 key 是持久配置态，重试必再失败。
+  assert.equal(
+    isRetryableFailure('dsh: MISSING_CREDENTIAL: llm-deepseek: no API key for provider route "deepseek-official"; store DEEPSEEK_API_KEY through the credentials service'),
+    false,
+  )
+  assert.equal(
+    isRetryableFailure('dsh: MISSING_CREDENTIAL: llm-pi-ai: no credential for provider route "los"; its profile resolves LOS_AUTH_TOKEN, which is not set'),
+    false,
+  )
+  // 负向控制：其余浮层仍必须可重试，否则这条规则会吃掉真·瞬时故障
+  assert.equal(isRetryableFailure('dsh: TRANSPORT: DeepSeek API request failed'), true)
+  assert.equal(isRetryableFailure('rate limit exceeded, retry later'), true)
+  assert.equal(isRetryableFailure('dsh: AUTH: 401: {"message":"Model hy3-free is not supported"}'), true,
+    'model-unavailable 仍优先判可重试（否则 fallback 链永远走不到）')
+  assert.equal(isRetryableFailure('HTTP 500 Internal Server Error from provider'), true)
+})
+
 test('shouldRetry: model-unavailable failure retries and reaches the fallback attempt', async () => {
   const { shouldRetry } = await import(pluginHref)
   const job = { id: 'j1' }
