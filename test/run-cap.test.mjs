@@ -160,7 +160,12 @@ test('白名单必须覆盖 normalizeJob 的每个 null 清除分支（漏一个
   // null 清除"能防住"加进名单却没实现清除"的反向错误。
   const job = {
     name: 't', prompt: 'p', trigger: { kind: 'interval', expression: '1d' }, workspace: '/tmp', enabled: true,
-    ...Object.fromEntries(EXPLICIT_CLEAR_KEYS.filter((k) => k !== 'model' && k !== 'notify').map((k) => [k, k === 'maxAttempts' || k === 'maxRunsPerDay' || k === 'retryDelayMs' || k === 'timeoutMs' ? 5 : 'x'])),
+    ...Object.fromEntries(EXPLICIT_CLEAR_KEYS.filter((k) => k !== 'model' && k !== 'notify').map((k) => [
+      k,
+      // artifactPaths 是数组字段（2026-11-01 新增）：给字符串会被 normalizeJob 正确拒绝，
+      // 那不是本用例要测的东西，所以这里给合法形状。
+      k === 'artifactPaths' ? ['x'] : k === 'maxAttempts' || k === 'maxRunsPerDay' || k === 'retryDelayMs' || k === 'timeoutMs' ? 5 : 'x',
+    ])),
     model: { provider: 'a', model: 'b' },
     notify: { channel: 'feishu' },
   }

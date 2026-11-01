@@ -30,6 +30,7 @@ import { homedir } from 'node:os'
 import { Store, newId, nowIso } from './lib/store.mjs'
 import { parseCron, nextCronAfter, cronOccurrences, parseInterval, CronParseError } from './lib/cron-next.mjs'
 import { renderModelOverridePatch } from './lib/model-override.mjs'
+import { computeProgress, dateVars } from './lib/progress-hash.mjs'
 import {
   classifyFailure, isEnvironmentFailure, describeFailureKind, missingCredential, FAILURE_KINDS,
 } from './lib/failure-class.mjs'
@@ -889,6 +890,25 @@ export function normalizeJob(input, existing) {
       deliveryKey = text === '' ? undefined : text
     }
   }
+  // artifactPaths: 受检产物路径（进展判定的唯一真值来源）。见 lib/progress-hash.mjs
+  // 的长注释：声明了才在 finish 行写 progress.artifactHash；未声明必须留空，让
+  // agent-progress-watchdog 判 unknown（exit 2），而不是拿退出码/耗时凑一个"进展"。
+  // null 清除，undefined 保持；去重 + 截断（20 条 × 400 字符），脏值直接丢弃。
+  let artifactPaths = existing?.artifactPaths
+  if (input.artifactPaths !== undefined) {
+    if (input.artifactPaths === null) {
+      artifactPaths = undefined
+    } else if (Array.isArray(input.artifactPaths)) {
+      const cleaned = [...new Set(
+        input.artifactPaths
+          .map((p) => (p === null || p === undefined ? '' : String(p).trim().slice(0, 400)))
+          .filter((p) => p !== ''),
+      )].slice(0, 20)
+      artifactPaths = cleaned.length > 0 ? cleaned : undefined
+    } else {
+      throw new Error('artifactPaths must be an array of path strings or null')
+    }
+  }
   let notify = existing?.notify
   if (input.notify !== undefined) {
     if (input.notify === null) {
@@ -910,6 +930,7 @@ export function normalizeJob(input, existing) {
     ...(maxRunsPerDay !== undefined ? { maxRunsPerDay } : {}),
     ...(model ? { model } : {}),
     ...(assertCmd ? { assertCmd } : {}),
+    ...(artifactPaths?.length ? { artifactPaths } : {}),
     ...(notify ? { notify } : {}),
     ...(deliveryKey ? { deliveryKey } : {}),
   }
@@ -931,7 +952,7 @@ export function normalizeJob(input, existing) {
  */
 export const EXPLICIT_CLEAR_KEYS = [
   'model', 'deliverTo', 'assertCmd', 'notify', 'deliveryKey',
-  'catchUpPolicy', 'maxAttempts', 'retryDelayMs', 'timeoutMs', 'maxRunsPerDay',
+  'catchUpPolicy', 'maxAttempts', 'retryDelayMs', 'timeoutMs', 'maxRunsPerDay', 'artifactPaths',
 ]
 
 /**
@@ -1476,6 +1497,23 @@ export function apply(ctx, config) {
         durationMs,
         outputHead: output,
         completedAt,
+      }
+      // 进展证据（2026-10-31 Super-agent 卡 T3）：按 job 的 artifactPaths 算产物哈希，
+      // 按 job 的原始动作声明算动作哈希 —— 契约方是 dsfolder/scripts/agent-progress-watchdog.mjs。
+      // **未声明就什么都不写**：该 watchdog 在字段缺失时判 unknown（exit 2），这是有意的
+      // —— 用 exitCode/耗时/outputHead 顶替会造出一个永远绿的"进展"判据。
+      // 哈希失败只降级为"这次没有证据"（不写 progress），绝不打断台账写入：
+      // finish() 抛异常曾导致整树崩溃循环（2026-08-18 事故）。
+      try {
+        // 日期占位符（{{DSH_SCHED_DATE}} / {{DSH_SCHED_DATE_COMPACT}}）按**本次触发时刻 +
+        // 作业时区**展开，否则日报那类带日期的产物名只能写死一天，第二天就永远读不到。
+        const zone = job.trigger?.timezone && job.trigger.timezone !== 'local' ? job.trigger.timezone : undefined
+        const computed = computeProgress(job, { cwd: workspace, vars: dateVars(scheduledFor ?? startedAt, zone) })
+        if (computed.progress) finalRun.progress = computed.progress
+      } catch (error) {
+        ctx.logger.warn(
+          `[dsh-scheduler] progress hash failed for run ${runId} (job "${job.name}" ${job.id}): ${renderThrown(error)}`,
+        )
       }
       if (failed && !finalRun.error) {
         // 2026-10-28 审计：失败但没有任何 error 时，台账最终只剩 "[attempt N/N] gave up"

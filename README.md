@@ -134,6 +134,49 @@ DSH 的定时任务（cron / interval / once）插件：宿主半包负责**持�
 工作区外的 `~/.dsh/scripts/feishu-push.sh`（表现为 `ledger_write_failed` ⇒ `deliveryMissing` 假红）。
 推送型作业的 workspace 用 `~/.dsh/scheduler-reports`（与既有 7 个作业一致）。
 
+### 0.6.0 进展证据：finish 行记录 `progress.artifactHash` / `progress.actionHash`（2026-11-01）
+
+> **⚠️ 需要重载宿主才生效**：宿主半包是 Cordis 插件，代码在本进程里加载。改完本仓后，
+> 运行中的 `dsh web` 仍跑旧代码，`runs.jsonl` 不会出现 `progress` 字段
+> （`/plugins/dsh-scheduler/status` 的 `version` 会变成新值、`loadedVersion` 不变 —— 两者不等即"还没重载"）。
+> 本次交付**没有重启宿主**。
+
+- **为什么**：`dsfolder/scripts/agent-progress-watchdog.mjs`（Super-agent G4）回答的是「同样的事反复跑，
+  受检产物到底变没变」。它只认 finish 行的 `progress.artifactHash` / `progress.actionHash`，字段缺失时
+  **必须判 unknown（exit 2）** —— 用 exitCode / 耗时 / `outputHead` 顶替会造出一个永远绿的假判据。
+  在此之前本插件 finish 行只有 `exitCode`/`assertExitCode`/`durationMs`/`outputHead`，所以那个 watchdog
+  在真台账上恒为 exit 2（2026-11-01 实测：`missing-progress-object`）。
+- **作业侧声明（新增字段）**：`job.artifactPaths: string[]` —— 本作业产出的受检产物路径
+  （最多 20 条、每条 ≤400 字符；相对路径以 job workspace 为基准，支持 `~` 与绝对路径）。
+  `null` 清除（已进 `EXPLICIT_CLEAR_KEYS` 白名单，`PATCH {"artifactPaths": null}` 真的删键）。
+  日期占位符按**本次触发时刻 + 作业时区**展开：`{{DSH_SCHED_DATE}}` → `2026-11-01`、
+  `{{DSH_SCHED_DATE_COMPACT}}` → `20261101`（日报类产物名带日期，没有它声明只能写死一天）。
+  注意 `artifactHash` 里进的是**未展开的声明模板** —— 同内容 + 同模板 ⇒ 同哈希，
+  「每天一个新文件名」不会被误判成「产物在变」。
+- **finish 行新增**：
+
+  ```jsonc
+  "progress": {
+    "artifactHash": "<sha256 聚合：声明路径 + 单文件 sha256 + 字节数>",
+    "actionHash":   "<sha256：动作声明（prompt 原文/workspace/model/assertCmd/deliverTo/deliveryKey/maxRunsPerDay）>",
+    "artifactPaths": ["reports/x.md"],
+    "artifactBytes": 12345
+  }
+  ```
+
+- **三条不可让步的口径**（详见 `lib/progress-hash.mjs` 的注释）：
+  1. **没有声明就没有哈希** —— 未声明 `artifactPaths` 的作业，finish 行**不带** `progress`，watchdog 因此判 unknown。
+     绝不用 exit code / 耗时 / `outputHead` 凑一个"进展"。
+  2. **读不到就没有哈希** —— 声明了但文件缺失/不可读/超 32 MiB，只写 `progress.artifactProblems`
+     （**不含** `artifactHash`）。空集哈希会变成一个永远不变的"产物"，把 unknown 伪装成 stalled。
+  3. **动作哈希取原始声明，不取运行投影** —— prompt 里的 `{{DSH_SCHED_RUN_KEY}}` 等占位符按**原文**参与哈希；
+     渲染后每次触发都不同，那样的 actionHash 永远在变，会把 drifting 洗成 stalled。`name`/`trigger`/`enabled`/
+     重试策略**不**参与（它们不是"动作"）。
+- **开销**：哈希在 `finish()` 里同步做（1 MiB 分块流式读），单文件上限 32 MiB；任何异常只降级为
+  「这次没有证据」，绝不打断台账写入（2026-08-18 crash-loop 纪律）。
+- **验证**：`test/progress-hash.test.mjs`（16 项；含负向控制：未声明 → 无 progress；产物缺失 → 无 artifactHash；
+  真 watchdog 离线夹具 exit 0/1/2 三出口）。
+
 ## 一、调研结论：为什么需要这个插件
 
 ### 1.1 DSH 现状（2026-08-15 核查）
@@ -216,6 +259,7 @@ DSH 内置 `@deepseek-ai/dsh-schedule`（`packages/schedule/schedule`），它�
   "state": "scheduled",             // scheduled | paused | completed(once 已触发)
   "deliverTo": { "sessionId": "session-..." },  // 可选：运行结果 followup 进该会话（须在线）
   "catchUpPolicy": "run_once",      // 可选：'run_once'(错过补跑) | 'skip'(超时差跳过)；缺省跟随全局
+  "artifactPaths": ["reports/x.md"], // 可选：受检产物路径 ⇒ finish 行写 progress.artifactHash（见 0.6.0）
   "pausedReason": null,             // 熔断自动暂停时 = 'max_consecutive_failures'
   "nextRunAt": "2026-08-16T01:00:00.000Z",
   "lastRunAt": null,
@@ -234,6 +278,7 @@ DSH 内置 `@deepseek-ai/dsh-schedule`（`packages/schedule/schedule`），它�
   "exitCode": 0, "durationMs": 1234, "outputHead": "...(尾部 8KB)",
   "dispatchLatencyMs": 41234,
   "assertExitCode": 0,
+  "progress": { "artifactHash": "...", "actionHash": "...", "artifactPaths": ["reports/x.md"] },
   "delivery": { "status": "delivered"|"skipped"|"error", "sessionId": "...", "reason": "..." },
   "sessionDir": "...", "startedAt": "...", "completedAt": "..." }
 ```
@@ -297,7 +342,7 @@ spawn(process.execPath,
 | GET | `/scheduler/jobs` | 任务列表 |
 | POST | `/scheduler/jobs` | 创建任务（校验 + 重算 nextRunAt） |
 | GET | `/scheduler/jobs/:id` | 单个任务 |
-| PATCH | `/scheduler/jobs/:id` | 更新（name/prompt/trigger/workspace/enabled/deliverTo/catchUpPolicy/maxAttempts/retryDelayMs/timeoutMs/maxRunsPerDay/model） |
+| PATCH | `/scheduler/jobs/:id` | 更新（name/prompt/trigger/workspace/enabled/deliverTo/catchUpPolicy/maxAttempts/retryDelayMs/timeoutMs/maxRunsPerDay/model/assertCmd/notify/deliveryKey/artifactPaths；传 `null` 清除） |
 | DELETE | `/scheduler/jobs/:id` | 删除（含台账） |
 | POST | `/scheduler/jobs/:id/trigger` | 手动触发一次（triggerKind=manual） |
 | POST | `/scheduler/jobs/:id/pause` / `/resume` | 暂停 / 恢复 |
