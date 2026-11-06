@@ -179,17 +179,40 @@ DSH 的定时任务（cron / interval / once）插件：宿主半包负责**持�
 
 ## 一、调研结论：为什么需要这个插件
 
-### 1.1 DSH 现状（2026-08-15 核查）
+### 1.1 DSH 现状（2026-08-15 初查；**2026-11-06 按 0.2.2-rc.1 更新**）
 
-DSH 内置 `@deepseek-ai/dsh-schedule`（`packages/schedule/schedule`），它是**会话级 reminder**：
+DSH 内置 `@deepseek-ai/dsh-schedule`（`packages/schedule/schedule`）。**0.2.2 起它已不是"只管调用方
+会话的 reminder"**，按上游 `docs/upgrade-guide/v0.2.2-alpha.2/schedule-agent-tools` 与
+`schedule-remote-host-tasks`：
 
-- 事件溯源：`schedule/change` 事件写进会话日志，`ScheduleRuntime` 折叠事件 + `setTimeout` 派生唤醒；
-- 三种触发器：`after_seconds` / `at` / `every_seconds`（固定间隔，非 cron 表达式）；
-- 到期行为：`agent.followup(createUserMessage(...))` —— 只向**当前活着的根 agent 会话**注入一条提醒消息；
-- 工具面：`schedule_create` / `schedule_list` / `schedule_delete`；
-- 无跨会话执行、无 cron 表达式、无任务定义持久化（定义随会话日志）、无运行台账、无管理页面。
+- 任务定义是**宿主级**的（不再是"随会话日志走"的提醒）：`schedule_*` 工具可以按 id 读取/修改/删除
+  **宿主的任意任务**，而不只是调用方会话的；
+- 触发器从「`after_seconds`/`at`/`every_seconds`」换成 **RRULE**：`schedule_create` 收
+  `title`/`prompt`/`rrule`（一行 `DTSTART` + 一行 `RRULE`）/`target`；
+- `target` 决定到期往哪投：`this_session`（原会话）· **`new_once`**（同一个新会话，首次投递时开）·
+  **`new`**（每次开新会话）⇒ **已有跨会话执行**；
+- 工具面：`schedule_create` / `schedule_list` / `schedule_view` / `schedule_edit`
+  （`action:"update"|"delete"`，可改 rrule/target，可暂停/恢复）；**`schedule_update` / `schedule_delete` 已移除**；
+- 被委派的子 agent 调这些工具会返回 `subagent_session`（不能用定时任务）；
+- 已知状态（本机 dump-config 实证）：web 的 `standard` preset 里有 `tool-schedule` 行，`schedule` 服务在
+  web-app 层；`schedule_create` 的参数是 rrule，**不**接受 `after_seconds`。
 
-**结论**：DSH 有「定时提醒」，没有「定时任务」——后者需要：跨会话/独立执行面、cron 语法、可管理的任务定义存储、运行记录与重试、管理 UI。这就是 dsh-scheduler 的定位。
+**结论（更新后的定位）**：上游已有「宿主级定时任务 + RRULE + 新会话投递」，所以 dsh-scheduler 的
+差异化收窄为**执行面的账与治理**，这几项上游仍没有：
+
+| 维度 | 上游 `dsh-schedule`（0.2.2） | dsh-scheduler（本插件） |
+|---|---|---|
+| 触发 | RRULE（分钟/小时/日/周/月/年 + BY*） | cron / interval / once |
+| 跨会话 | ✅ `target: new_once / new` | ✅ 独立 session（`session-dispatch`） |
+| 运行台账 | ❌ | ✅ 事件溯源 `runs.jsonl`（evt:start/finish/session/…） |
+| 投递回执 / IM 推送 | ❌ | ✅ 交付键 + `feishu-push` 幂等投递 |
+| 重试 / 退避 / 预算 / 跑飞保护 | ❌ | ✅（`maxRunsPerDay`、失败语义、预算账本） |
+| 产物哈希 / 进度证据 / watchdog | ❌ | ✅（artifactHash/progress、stuck 判定） |
+| 跨机执行 | 仅本宿主 | ✅ 经 los/executor（可选） |
+
+⇒ **分工**：一次性/简单周期/「到期开个会话跑一句」→ 用上游 `schedule_create(target:new_once|new)`；
+要台账、投递、重试、预算、跨机 → 用 dsh-scheduler。两者可以并存（不同 id 空间：上游是宿主任务，
+本插件是 `~/.dsh/storages/dsh-scheduler/jobs.json`）。
 
 ### 1.2 参照实现对比
 
