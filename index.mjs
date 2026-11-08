@@ -1328,7 +1328,18 @@ export function apply(ctx, config) {
           finish({ status: 'succeeded', exitCode: 0, ...(assertion ? { assertExitCode: 0 } : {}) })
         }).catch((error) => {
           if (settled) return
-          finish({ status: 'succeeded', exitCode: 0, assertError: renderThrown(error) })
+          // 2026-11-08 修正（Codex 只读评审指出）：这里原来写 `status:'succeeded', exitCode:0`
+          // —— 于是**整条链上任何异常**（assert 装配出错、后处理 TypeError、判据自身崩）
+          // 都会被记成"成功"，连 exitCode 都写成 0。这是本仓反复要消的假绿形态：
+          // 台账说绿、人以为跑了，实际判据根本没跑完。
+          // 异常既不是成功也不是"作业明确失败"，所以记 failed（不可重试的确定性结局）
+          // 并保留 assertError 与原异常文本，让台账能看出是哪一段炸的。
+          finish({
+            status: 'failed',
+            exitCode: -1,
+            assertError: renderThrown(error),
+            error: `run pipeline threw: ${renderThrown(error)}`.slice(0, 500),
+          })
         })
       } else {
         // 必须写 error：否则台账里只剩 "[attempt N/N] retrying in Ns" 这样的重试簿记，
