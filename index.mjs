@@ -34,6 +34,9 @@ import { computeProgress, dateVars } from './lib/progress-hash.mjs'
 import {
   classifyFailure, isEnvironmentFailure, describeFailureKind, missingCredential, FAILURE_KINDS,
 } from './lib/failure-class.mjs'
+import {
+  channelRegistryPath, readChannelRegistry, requiredChannelsFor, evaluateChannelGate,
+} from './lib/channel-gate.mjs'
 
 /** 插件版本（/plugins/<id>/status 约定用；读 package.json，失败返回 null）。 */
 function pluginVersion() {
@@ -909,6 +912,26 @@ export function normalizeJob(input, existing) {
       throw new Error('artifactPaths must be an array of path strings or null')
     }
   }
+  // requiresChannels: 执行前必须可用的渠道（L2-4）。与 notify.require 的关系见
+  // lib/channel-gate.mjs 的注释：require=true 的 job **自动**要求它的 channel，
+  // 这里只登记"不推送但依赖渠道"的额外声明（例如 prompt 里要读渠道消息）。
+  // null 清除，undefined 保持；去重 + 截断（最多 8 个，超出丢弃而不是报错——保持与
+  // artifactPaths 同一宽松口径，脏值不阻断保存）。
+  let requiresChannels = existing?.requiresChannels
+  if (input.requiresChannels !== undefined) {
+    if (input.requiresChannels === null) {
+      requiresChannels = undefined
+    } else if (Array.isArray(input.requiresChannels)) {
+      const cleaned = [...new Set(
+        input.requiresChannels
+          .map((c) => (c === null || c === undefined ? '' : String(c).trim().slice(0, 60)))
+          .filter((c) => c !== ''),
+      )].slice(0, 8)
+      requiresChannels = cleaned.length > 0 ? cleaned : undefined
+    } else {
+      throw new Error('requiresChannels must be an array of channel ids or null')
+    }
+  }
   let notify = existing?.notify
   if (input.notify !== undefined) {
     if (input.notify === null) {
@@ -922,6 +945,7 @@ export function normalizeJob(input, existing) {
   }
   return {
     name, prompt, trigger, workspace, enabled,
+    ...(requiresChannels ? { requiresChannels } : {}),
     ...(deliverTo ? { deliverTo } : {}),
     ...(catchUpPolicy ? { catchUpPolicy } : {}),
     ...(maxAttempts !== undefined ? { maxAttempts } : {}),
@@ -1257,6 +1281,28 @@ export function apply(ctx, config) {
         + (runModel.reasoningEffort ? ` (${runModel.reasoningEffort})` : '')
         + (attempt > 1 ? ` attempt=${attempt}` : ''),
       )
+    }
+
+    // 渠道门禁（L2-4，2026-11-14）：job 依赖的渠道不可用 ⇒ **不跑**，记
+    // `skipped: channel_unavailable`（不是 failed、不是 no_op、不是 exit 0）。
+    // 为什么必须在这里而不是"跑完发现没发出去"：那时已经烧掉一次 run 预算与失败链，
+    // 而且台账只能说 delivery_missing（"该发而没发"），把"渠道关了"说成"任务坏了"。
+    const channelNeeds = requiredChannelsFor(job)
+    if (channelNeeds.length > 0) {
+      const gate = evaluateChannelGate({ requires: channelNeeds, reg: readChannelRegistry(channelRegistryPath()) })
+      if (!gate.ok) {
+        ctx.logger.warn(
+          `[dsh-scheduler] run ${runId} skipped: ${gate.reason} (${gate.detail}); `
+          + `job "${job.name}" (${job.id}) not started`,
+        )
+        finish({
+          status: 'skipped',
+          skippedReason: gate.reason,
+          startedAt,
+          error: `skipped: ${gate.reason} — ${gate.detail}`,
+        })
+        return
+      }
     }
 
     // 凭据预检（"根本没跑起来"≠"跑失败了"）：白名单 route + 凭据环境变量全缺 ⇒
@@ -1839,9 +1885,22 @@ export function apply(ctx, config) {
 
   // ---- scheduler loop -------------------------------------------------------
 
+  /** 最近一次"调度器自己没跑成"的原因（锁被拒/…）。null = 正常。status 端点会暴露它。 */
+  let lastTickProblem = null
+
   function tick() {
     if (stopping) return
-    if (!store.acquireLock()) return // another instance is ticking
+    {
+      const lock = store.acquireLock()
+      if (!lock.ok) {
+        if (lock.reason === 'busy') return // 正常抢占：另一个实例在 tick
+        // denied：锁目录建不出来（EACCES/EPERM/……）。这**不是**"别人在跑"，
+        // 而是"本调度器根本没在跑"——以前 return false 被一起吞掉，表现为 exit 0 + 无红。
+        lastTickProblem = `lock acquire ${lock.reason} (code=${lock.code ?? 'unknown'}) at ${nowIso()}`
+        ctx.logger.error(`[dsh-scheduler] tick lock acquire failed: ${lastTickProblem}`)
+        return
+      }
+    }
     try {
       lastTickAt = new Date().toISOString()
       const now = Date.now()
@@ -2021,6 +2080,7 @@ export function apply(ctx, config) {
       ok: true,
       lastTickAt,
       lockHeld: existsSync(store.lockPath),
+      lockProblem: lastTickProblem,
       inflight: [...inflight.entries()].map(([jobId, runId]) => ({ jobId, runId })),
       jobCount: jobs.length,
       enabledCount: jobs.filter((j) => j.enabled && j.state !== 'paused' && j.state !== 'completed').length,
@@ -2212,6 +2272,7 @@ export function apply(ctx, config) {
         detail: {
           lastTickAt,
           lockHeld: existsSync(store.lockPath),
+          lockProblem: lastTickProblem,
           // CLI 解析诊断：解析失败时插件照常加载（不拖垮插件树），问题在这里与
           // 每次运行的 failed 台账行里可见 —— /plugins/<id>/status 是工具查询面。
           cliEntry: defaultEntry?.source ?? null,

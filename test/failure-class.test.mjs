@@ -19,6 +19,8 @@ test('每个归因都在 FAILURE_KINDS 里（新增类别必须登记，否则�
     [{ deliveryMissing: true, error: 'delivery missing for key "k"' }, 'delivery_missing'],
     [{ deliveryDuplicate: true, error: 'delivery duplicated for key "k"' }, 'delivery_duplicate'],
     [{ deliveryStray: true, error: 'delivery stray keys during this run: x' }, 'delivery_stray'],
+    [{ error: 'skipped: channel_unavailable — feishu=disabled（dep 在，但挂载行 disabled: true）' }, 'channel_unavailable'],
+    [{ error: 'skipped: channel_registry_unreadable — 读不到健康面：ENOENT' }, 'channel_registry_unreadable'],
     [{ error: 'spawn: ENOENT' }, 'spawn_error'],
     [{ exitCode: 3 }, 'exit_nonzero'],
     [{}, 'unknown'],
@@ -65,7 +67,12 @@ test('显式布尔证据优先于文本（代码路径结论压过字符串巧�
 })
 
 test('环境类归因集合 = 缺凭据 / 超窗 / 起不来（重试无用且不计入失败链）', () => {
-  assert.deepEqual([...ENVIRONMENT_KINDS].sort(), ['context_window_exceeded', 'missing_credential', 'spawn_error'])
+  // 2026-11-14（L2-4）：加入两个渠道类归因 —— 渠道不可用/健康面读不到属"机器没准备好"，
+  // 重试不会让渠道自己回来（重试只是再烧一次 run 预算），但**必须告警**。
+  assert.deepEqual(
+    [...ENVIRONMENT_KINDS].sort(),
+    ['channel_registry_unreadable', 'channel_unavailable', 'context_window_exceeded', 'missing_credential', 'spawn_error'],
+  )
   for (const k of FAILURE_KINDS) {
     assert.equal(
       isEnvironmentFailure(k),
