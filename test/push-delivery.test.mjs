@@ -321,6 +321,25 @@ test('renderPrompt：占位符全部替换；无占位符或 runKey 为空时原
   // 而互相 dedup 掉。
   assert.equal(mod.renderPrompt('--key "{{DSH_SCHED_RUN_KEY}}"', ''), '--key "{{DSH_SCHED_RUN_KEY}}"')
   assert.ok(!mod.renderPrompt('--key "{{DSH_SCHED_RUN_KEY}}"', '').includes('job-'))
+
+  // 2026-11-14 补：交付键占位符（`{{DSH_SCHED_DELIVERY_KEY}}`）。此前的用例只覆盖 runKey，
+  // 而"事件域交付键"的 job（67166722 / 63261034 / ce5b5c94 / 440be80b…）全都依赖它：
+  // 不替换 ⇒ agent 拿字面量当 key 推送 ⇒ 脚本层去重失效 + scheduler 判 delivery stray。
+  assert.equal(
+    mod.renderPrompt('--key "{{DSH_SCHED_DELIVERY_KEY}}"', 'rk', 'verify-assets-job-x-20261116'),
+    '--key "verify-assets-job-x-20261116"',
+    'deliveryKey 在时必须替换',
+  )
+  // 负向控制：没配 deliveryKey 模板（undefined/null/''）时**原样保留**，与 runKey 同一纪律
+  // （宁可留占位符让门禁看见，也不塞一个空键让所有 job 互相 dedup）。
+  for (const empty of [undefined, null, '']) {
+    assert.equal(mod.renderPrompt('--key "{{DSH_SCHED_DELIVERY_KEY}}"', 'rk', empty), '--key "{{DSH_SCHED_DELIVERY_KEY}}"')
+  }
+  // runKey 与 deliveryKey 同时出现时各替换各的
+  assert.equal(
+    mod.renderPrompt('{{DSH_SCHED_RUN_KEY}} | {{DSH_SCHED_DELIVERY_KEY}}', 'rk', 'dk'),
+    'rk | dk',
+  )
 })
 
 test('端到端：spawn 给 agent 的 prompt 里占位符已换成 runKey（bash 工具不继承 env，这是唯一通道）', async (t) => {

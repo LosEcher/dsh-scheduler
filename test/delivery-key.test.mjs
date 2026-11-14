@@ -51,3 +51,14 @@ test('{{scheduledFor}} 原样注入，{{slot}} 同样以事件时刻渲染', () 
   assert.ok(out.startsWith('k-0835-'), out)
   assert.ok(out.endsWith(scheduledFor), out)
 })
+
+test('模板 {{jobId}}/{{date}}：本次 440be80b 用的形状（date 按 scheduledFor 本地时区）', async () => {
+  const mod = await import(pluginHref)
+  const job = { id: 'job-440be80b-ecc', deliveryKey: 'verify-assets-{{jobId}}-{{date}}' }
+  // 2026-11-16 07:30 +08 = 2026-11-15T23:30Z ⇒ 本地日期 20261116
+  const key = mod.computeDeliveryKey(job, 'rk', '2026-11-15T23:30:00.000Z', new Date('2026-11-15T23:30:00.000Z'))
+  assert.equal(key, 'verify-assets-job-440be80b-ecc-20261116')
+  // 同一次事件的重试（attempt 墙钟不同）必须得到同一个键（幂等的前提）
+  const retry = mod.computeDeliveryKey(job, 'rk', '2026-11-15T23:30:00.000Z', new Date('2026-11-15T23:35:00.000Z'))
+  assert.equal(retry, key)
+})

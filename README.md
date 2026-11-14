@@ -82,6 +82,17 @@ DSH 的定时任务（cron / interval / once）插件：宿主半包负责**持�
   不会被脚本当成重复；反之已送达则 `.sent` 在，重试推不出第二条）。默认 `false`：
   先观测遵守率，避免"机制本身变成重复推送源"。
 
+> ⚠️ **常见陷阱（2026-11-14 实测回归，代价是整月静默）**：`scheduler 不自己发消息` 这句话的另一面是
+> ——**关了 notify 就等于关了交付跟踪**。11-11 那轮把 `job-440be80b` 的 `notify` 改成 `null`
+> 的同时，又**在 prompt 里写"不要调用 feishu-push.sh，调度器会投递"**：两边都以为对方在发，
+> 结果该作业一条都没推，且因为 `notify=null` 连 `missing` 都不记（台账 `push=null`）——
+> **零交付且完全不可见**。
+> 判据（人工/评审时看两条）：①prompt 里若出现 `feishu-push.sh` 的自调命令，job **必须**配
+> `notify`（否则 .sent 无人读）；②prompt 里若禁止 agent 推送，必须指明**谁**在推（脚本？launchd？），
+> 否则就是零交付。
+> 另：`{{DSH_SCHED_DELIVERY_KEY}}`（事件域交付键）与 `{{DSH_SCHED_RUN_KEY}}` 是**两个**占位符，
+> 推送必须用 delivery 那个；用 runKey 会被判 `delivery stray`。
+
 **C. 失败告警带 key**：`<jobId>|<scheduledFor>|alert|<consecutiveFailures>` —— 同一次触发
 只告警一次，失败链变长则换 key 继续升级，不会被误吞。
 
