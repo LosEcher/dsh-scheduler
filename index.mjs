@@ -31,6 +31,7 @@ import { Store, newId, nowIso } from './lib/store.mjs'
 import { parseCron, nextCronAfter, cronOccurrences, parseInterval, CronParseError } from './lib/cron-next.mjs'
 import { renderModelOverridePatch } from './lib/model-override.mjs'
 import { computeProgress, dateVars } from './lib/progress-hash.mjs'
+import { countsOf, healthOf } from './lib/job-health.mjs'
 import {
   classifyFailure, isEnvironmentFailure, describeFailureKind, missingCredential, FAILURE_KINDS,
 } from './lib/failure-class.mjs'
@@ -2256,11 +2257,13 @@ export function apply(ctx, config) {
         // 两者不等说明"代码改了但宿主还没重启"（见 LOADED_VERSION 的长注释）。
         version: pluginVersion(),
         loadedVersion: LOADED_VERSION,
+        // 两轴折叠（2026-11-18）：调度轴（enabled/paused/completed，互斥完备）与
+        // 故障轴（active-failing / auto-paused-failing / manual-paused-unresolved）。
+        // `failing` 保留为三个失败态之和：旧消费方读它，改名会让人"看不见"；
+        // 但它不再是唯一读数 —— 只看它无法区分"还在烧钱"与"已被熔断停掉但故障未解决"。
         counts: {
-          jobs: jobs.length,
-          enabled: jobs.filter((j) => j.enabled && j.state !== 'paused' && j.state !== 'completed').length,
+          ...countsOf(jobs),
           inflight: inflight.size,
-          failing: jobs.filter((j) => (j.consecutiveFailures ?? 0) > 0).length,
           // 交付面：跟踪投递的 job 数 / 最近一次**该发而没发**的 job 数 / 有意静默的
           // job 数。assertCmd 只看报告文件，这是唯一能看出「发了几条」的计数
           // （2026-10-03 复盘）。skipped 是合法状态，不能混进 missing。
@@ -2291,6 +2294,7 @@ export function apply(ctx, config) {
             lastStatus: j.lastStatus ?? null,
             lastRunAgeMs: j.lastRunAt ? Date.now() - Date.parse(j.lastRunAt) : null,
             consecutiveFailures: j.consecutiveFailures ?? 0,
+            ...healthOf(j),
             lastDispatchLatencyMs: j.lastDispatchLatencyMs ?? null,
             assertCmd: Boolean(j.assertCmd),
             notify: j.notify ?? null,
