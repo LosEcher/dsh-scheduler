@@ -2213,6 +2213,13 @@ export function apply(ctx, config) {
       enabled: true,
       state: next === null && job.trigger.kind === 'once' ? 'completed' : 'scheduled',
       nextRunAt: next ? new Date(next).toISOString() : job.nextRunAt,
+      // **resume = 重置熔断计数**（2026-11-18）。原来不清，于是人工确认修好并 resume 之后
+      // consecutiveFailures 仍停在阈值（实测 5），下一次失败立刻再次熔断 —— 让人误判
+      // "修了没用"。上一次的暂停原因不丢，移到 lastPausedReason/lastPausedAt 留档。
+      consecutiveFailures: 0,
+      ...(job.pausedReason ? { lastPausedReason: job.pausedReason, lastPausedAt: job.pausedAt ?? null } : {}),
+      pausedReason: null,
+      pausedAt: null,
       updatedAt: nowIso(),
     })
     scheduleWake()
